@@ -561,7 +561,7 @@ class VehicleSpeedEstimator:
         detections = []
         if YOLO_AVAILABLE and hasattr(self, 'vehicle_detector'):
             # Handle both single Results object and list of Results across ultralytics versions
-            results = self.vehicle_detector(image, conf=0.4, classes=[2, 5, 7])
+            results = self.vehicle_detector(image, conf=0.25, classes=[2, 3, 5, 7])
             results_list = results if isinstance(results, list) else [results]
 
             for r in results_list:
@@ -594,6 +594,7 @@ class VehicleSpeedEstimator:
             
             best_iou = 0
             best_detection_idx = -1
+            best_center_distance = float('inf')
             
             for i, detection in enumerate(detections):
                 if i in used_detections:
@@ -601,13 +602,26 @@ class VehicleSpeedEstimator:
                 
                 iou = self.calculate_iou(track.bbox, detection[:4])
                 
-                if iou > best_iou and iou > 0.3:  # Minimum IoU threshold
+                if iou > best_iou:
                     best_iou = iou
                     best_detection_idx = i
+                    # Track center distance for fallback association
+                    x1, y1, x2, y2 = track.bbox
+                    txc, tyc = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                    dx1, dy1, dx2, dy2, _ = detection
+                    dxc, dyc = (dx1 + dx2) / 2.0, (dy1 + dy2) / 2.0
+                    best_center_distance = np.hypot(dxc - txc, dyc - tyc)
             
             if best_detection_idx >= 0:
-                associated[track_id] = detections[best_detection_idx][:4]
-                used_detections.add(best_detection_idx)
+                # Accept association if IoU is reasonable or centers are close relative to box size
+                iou_ok = best_iou >= 0.1
+                # Use a distance threshold proportional to track bbox size
+                x1, y1, x2, y2 = track.bbox
+                bbox_size_threshold = 0.5 * min(max(x2 - x1, 1), max(y2 - y1, 1))
+                distance_ok = best_center_distance <= bbox_size_threshold
+                if iou_ok or distance_ok:
+                    associated[track_id] = detections[best_detection_idx][:4]
+                    used_detections.add(best_detection_idx)
         
         # Create new tracks for unassociated detections
         for i, detection in enumerate(detections):
@@ -772,7 +786,7 @@ class VehicleSpeedEstimator:
         results = {
             'timestamp': timestamp,
             'vehicles': [],
-            'calibrated': self.camera_intrinsics is not None,
+            'calibrated': (self.camera_intrinsics is not None and self.homography_ground is not None and self.scale_factor is not None),
             'vanishing_points': []
         }
         
