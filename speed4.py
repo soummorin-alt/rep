@@ -119,30 +119,39 @@ class DiamondSpaceVPDetector:
             self.transform_map[acc_q, acc_p] = transform_name
 
     def find_vanishing_points(self, num_vps: int = 3) -> List[Tuple[np.ndarray, float]]:
-        """Find vanishing points by detecting peaks in accumulator"""
+        """Find vanishing points by detecting peaks in accumulator with spatial diversity enforcement"""
         vps = []
         temp_acc = self.accumulator.copy()
         temp_transform_map = self.transform_map.copy()
-
+        
+        # Minimum distance between vanishing points (in accumulator space)
+        min_vp_distance = 50  # pixels in accumulator space
+        
         for _ in range(num_vps):
             # Find peak
             peak_idx = np.unravel_index(np.argmax(temp_acc), temp_acc.shape)
             peak_value = temp_acc[peak_idx]
-            if peak_value < 1.0:
+            
+            if peak_value < 1.0:  # Minimum threshold
                 break
-
+            
+            # Get transformation type used at this peak
             transform_type = temp_transform_map[peak_idx]
+            
             if transform_type == "":
                 break
-
-            # Convert accumulator indices back to (p,q)
+            
+            # Convert accumulator indices back to (p,q) coordinates
             q_acc, p_acc = peak_idx
+            
+            # Map back to diamond space coordinates
             p_range = 4 * self.mu
             q_range = 4 * self.mu
-            p = (p_acc / (self.resolution - 1) * p_range) - p_range / 2
-            q = (q_acc / (self.resolution - 1) * q_range) - q_range / 2
-
-            # Inverse mapping (approximate)
+            
+            p = (p_acc / (self.resolution - 1) * p_range) - p_range/2
+            q = (q_acc / (self.resolution - 1) * q_range) - q_range/2
+            
+            # Apply correct inverse mapping based on transform type
             if transform_type == "SS":
                 x = self.D * q
                 y = self.d * p + self.D * q - self.d * self.D
@@ -155,24 +164,61 @@ class DiamondSpaceVPDetector:
                 x = self.D * q
                 y = -self.d * p + self.D * q - self.d * self.D
                 w = 1.0
-            else:  # TT
+            else: #"TT":
                 x = self.D * q
                 y = -self.d * p + self.D * q + self.d * self.D
                 w = 1.0
-
+            
+            # Form vanishing point in homogeneous coordinates
             vp = np.array([x, y, w])
             vp = vp / vp[2]
-            vp_img = np.array([vp[0] / self.mu, vp[1] / self.mu, 1.0])
+            
+            # Convert back to image coordinates (denormalize)
+            vp_img = np.array([vp[0]/self.mu, vp[1]/self.mu, 1.0])
+            
+            # Check spatial diversity with previously selected VPs
+            if len(vps) > 0:
+                min_dist_to_existing = float('inf')
+                for existing_vp, _ in vps:
+                    dist = np.linalg.norm(vp_img[:2] - existing_vp[:2])
+                    min_dist_to_existing = min(min_dist_to_existing, dist)
+                
+                if min_dist_to_existing < min_vp_distance:
+                    print(f"Rejecting VP at ({vp_img[0]:.1f}, {vp_img[1]:.1f}) - too close to existing VPs (min dist: {min_dist_to_existing:.1f} px)")
+                    # Suppress this peak and continue to next
+                    temp_acc[peak_idx] = 0
+                    continue
+
             vps.append((vp_img, peak_value))
-
-            # Suppress neighborhood
-            mask_size = max(10, self.resolution // 20)
-            y_start = max(0, q_acc - mask_size)
-            y_end = min(temp_acc.shape[0], q_acc + mask_size + 1)
-            x_start = max(0, p_acc - mask_size)
-            x_end = min(temp_acc.shape[1], p_acc + mask_size + 1)
+            
+            # Remove peak region to find next VP (wider suppression for better diversity)
+            mask_size = max(20, self.resolution // 15)  # Increased from resolution // 20
+            y_start = max(0, peak_idx[0] - mask_size)
+            y_end = min(temp_acc.shape[0], peak_idx[0] + mask_size + 1)
+            x_start = max(0, peak_idx[1] - mask_size)
+            x_end = min(temp_acc.shape[1], peak_idx[1] + mask_size + 1)
+            
             temp_acc[y_start:y_end, x_start:x_end] = 0
-
+        
+        # Quality check: ensure we have enough well-distributed VPs
+        if len(vps) < 2:
+            print(f"Warning: Only {len(vps)} vanishing points found, need at least 2 for calibration")
+            return []
+        
+        # Final spatial diversity check
+        if len(vps) >= 2:
+            vp_coords = np.array([vp[:2] for vp, _ in vps])
+            distances = []
+            for i in range(len(vps)):
+                for j in range(i+1, len(vps)):
+                    dist = np.linalg.norm(vp_coords[i] - vp_coords[j])
+                    distances.append(dist)
+            
+            min_dist = min(distances) if distances else 0
+            if min_dist < min_vp_distance:
+                print(f"Warning: Final VP check failed - minimum distance {min_dist:.1f} px < threshold {min_vp_distance} px")
+                return []
+        
         return vps
 
 class KalmanFilter:
@@ -781,9 +827,10 @@ class VehicleSpeedEstimator:
                                 print(f"  Distance VP{i+1}-VP{j+1}: {dist:.1f} pixels")
                         
                         min_dist = min(distances)
-                        if min_dist < 100:  # pixels
-                            print(f"WARNING: Vanishing points too close (min distance: {min_dist:.1f} px)")
-                            print("Consider recalibration with better distributed vanishing points")
+                        if min_dist < 50:  # pixels
+                            print(f"ERROR: Vanishing points too close (min distance: {min_dist:.1f} px)")
+                            print("Insufficiently distributed vanishing points—skipping calibration step.")
+                            continue  # Skip to next frame instead of proceeding with bad calibration
                     
                     # Compute camera intrinsics
                     if self.compute_camera_intrinsics(vanishing_points, frame.shape):
@@ -802,6 +849,10 @@ class VehicleSpeedEstimator:
                         else:
                             print("ERROR: Ground homography computation failed!")
                             self.homography_ground = None
+                    else:
+                        print("ERROR: Camera intrinsics computation failed!")
+                        self.camera_intrinsics = None
+                        self.rotation_matrix = None
         self.calibration_frames += 1
         detections = self.detect_vehicles(frame)
         # If camera is calibrated but metric scale is missing, auto-calibrate using the tallest detection
