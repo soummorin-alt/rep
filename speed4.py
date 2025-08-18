@@ -243,10 +243,10 @@ class VehicleSpeedEstimator:
 
         # Feature tracking parameters
         self.feature_params = dict(
-            maxCorners=20,
-            qualityLevel=0.01,
-            minDistance=7,
-            blockSize=7
+            maxCorners=10,
+            qualityLevel=0.001,
+            minDistance=5,
+            blockSize=5
         )
         self.lk_params = dict(
             winSize=(21, 21),
@@ -485,68 +485,159 @@ class VehicleSpeedEstimator:
         union = area1 + area2 - intersection
         return intersection / union if union > 0 else 0.0
 
-    def track_features_and_estimate_speed(self, current_frame: np.ndarray, previous_frame: np.ndarray, track_id: int, bbox: Tuple[int, int, int, int], timestamp: float, dt: float) -> Optional[float]:
+    def track_features_and_estimate_speed(self, current_frame: np.ndarray, 
+                                         previous_frame: np.ndarray,
+                                         track_id: int, bbox: Tuple[int, int, int, int],
+                                         timestamp: float, dt: float) -> Optional[float]:
+        """Track features within vehicle bbox and estimate speed"""
         if self.homography_ground is None or self.scale_factor is None:
             return None
+        
         x1, y1, x2, y2 = bbox
+        
+        # Extract ROI
         roi_prev = previous_frame[y1:y2, x1:x2]
         roi_curr = current_frame[y1:y2, x1:x2]
+        
         if roi_prev.size == 0 or roi_curr.size == 0:
             return None
+        
+        # Convert to grayscale
         gray_prev = cv2.cvtColor(roi_prev, cv2.COLOR_BGR2GRAY) if len(roi_prev.shape) == 3 else roi_prev
         gray_curr = cv2.cvtColor(roi_curr, cv2.COLOR_BGR2GRAY) if len(roi_curr.shape) == 3 else roi_curr
+        
+        # Detect features
         features = cv2.goodFeaturesToTrack(gray_prev, **self.feature_params)
+        
         if features is None or len(features) == 0:
             return None
-        new_features, status, _ = cv2.calcOpticalFlowPyrLK(gray_prev, gray_curr, features, None, **self.lk_params)
-        back_features, status_back, _ = cv2.calcOpticalFlowPyrLK(gray_curr, gray_prev, new_features, None, **self.lk_params)
+        
+        # Track features using optical flow
+        new_features, status, error = cv2.calcOpticalFlowPyrLK(
+            gray_prev, gray_curr, features, None, **self.lk_params
+        )
+        
+        # Forward-backward consistency check
+        back_features, status_back, _ = cv2.calcOpticalFlowPyrLK(
+            gray_curr, gray_prev, new_features, None, **self.lk_params
+        )
+        
+        # Filter good features
         good_mask = (status.flatten() == 1) & (status_back.flatten() == 1)
-        if not np.any(good_mask):
+        if np.any(good_mask):
+            prev_good = features[good_mask].reshape(-1, 2)
+            back_good = back_features[good_mask].reshape(-1, 2)
+            fb_error = np.linalg.norm(prev_good - back_good, axis=1)
+            # Relaxed forward-backward threshold for better feature retention
+            refined_mask = fb_error < 10.0
+            if not np.any(refined_mask):
+                return None
+            prev_good = prev_good[refined_mask]
+            curr_good = new_features[good_mask].reshape(-1, 2)[refined_mask]
+            
+            # Debug: print number of features kept
+            print(f"Track {track_id}: {len(prev_good)} features kept for speed.")
+        else:
             return None
-        prev_good = features[good_mask].reshape(-1, 2)
-        back_good = back_features[good_mask].reshape(-1, 2)
-        fb_error = np.linalg.norm(prev_good - back_good, axis=1)
-        refined_mask = fb_error < 3.0
-        if not np.any(refined_mask):
-            return None
-        prev_good = prev_good[refined_mask]
-        curr_good = new_features[good_mask].reshape(-1, 2)[refined_mask]
+        
+        # Convert to image coordinates (add ROI offset)
         features_img = prev_good + np.array([x1, y1], dtype=np.float32)
         new_features_img = curr_good + np.array([x1, y1], dtype=np.float32)
-        world_displacements: List[np.ndarray] = []
+        
+        # Project to world coordinates
+        world_displacements = []
+        
         for (f1, f2) in zip(features_img, new_features_img):
             try:
+                # Project to ground plane
                 p1_homo = np.array([float(f1[0]), float(f1[1]), 1.0], dtype=np.float32)
                 p2_homo = np.array([float(f2[0]), float(f2[1]), 1.0], dtype=np.float32)
-                H_inv = np.linalg.inv(self.homography_ground)
-                world_p1 = H_inv @ p1_homo
-                world_p2 = H_inv @ p2_homo
-                if abs(world_p1[2]) > 1e-6:
-                    world_p1 = world_p1 / world_p1[2]
-                if abs(world_p2[2]) > 1e-6:
-                    world_p2 = world_p2 / world_p2[2]
-                displacement = (world_p2[:2] - world_p1[:2]) * self.scale_factor
-                world_displacements.append(displacement)
+                
+                # Use homography to project to ground plane
+                if self.homography_ground is not None:
+                    H_inv = np.linalg.inv(self.homography_ground)
+                    
+                    world_p1 = H_inv @ p1_homo
+                    world_p2 = H_inv @ p2_homo
+                    
+                    world_p1 = world_p1 / world_p1[2] if abs(world_p1[2]) > 1e-6 else world_p1
+                    world_p2 = world_p2 / world_p2[2] if abs(world_p2[2]) > 1e-6 else world_p2
+                    
+                    # Apply scale factor
+                    if self.scale_factor is not None:
+                        displacement = (world_p2[:2] - world_p1[:2]) * self.scale_factor
+                        world_displacements.append(displacement)
+            
             except (np.linalg.LinAlgError, ZeroDivisionError):
                 continue
+        
+        # Debug: print number of valid ground displacements
+        print(f"Track {track_id}: {len(world_displacements)} valid ground displacements.")
+        
         if not world_displacements:
+            # Fallback: use center-of-bbox motion if no features available
+            track = self.tracks.get(track_id)
+            if track and len(track.timestamps) >= 2:
+                # Get previous bbox from track history
+                prev_bbox = track.bbox if hasattr(track, 'bbox') else None
+                if prev_bbox is not None:
+                    # Calculate center displacement
+                    curr_center = np.array([(x1 + x2) / 2, (y1 + y2) / 2])
+                    prev_center = np.array([(prev_bbox[0] + prev_bbox[2]) / 2, (prev_bbox[1] + prev_bbox[3]) / 2])
+                    
+                    # Project centers to ground plane
+                    try:
+                        curr_homo = np.array([curr_center[0], curr_center[1], 1.0])
+                        prev_homo = np.array([prev_center[0], prev_center[1], 1.0])
+                        
+                        H_inv = np.linalg.inv(self.homography_ground)
+                        world_curr = H_inv @ curr_homo
+                        world_prev = H_inv @ prev_homo
+                        
+                        world_curr = world_curr / world_curr[2] if abs(world_curr[2]) > 1e-6 else world_curr
+                        world_prev = world_prev / world_prev[2] if abs(world_prev[2]) > 1e-6 else world_prev
+                        
+                        displacement = (world_curr[:2] - world_prev[:2]) * self.scale_factor
+                        speed_ms = np.linalg.norm(displacement) / dt
+                        speed_kmh = speed_ms * 3.6
+                        print(f"Track {track_id}: Using fallback center motion, speed: {speed_kmh:.1f} km/h")
+                        return speed_kmh
+                    except (np.linalg.LinAlgError, ZeroDivisionError):
+                        pass
+            
             return None
+        
+        # Calculate speeds for each displacement
         speeds = []
         for displacement in world_displacements:
-            speed_ms = float(np.linalg.norm(displacement)) / dt
-            speeds.append(speed_ms * 3.6)
-        if not speeds:
-            return None
-        median_speed = float(np.median(speeds))
-        track = self.tracks.get(track_id)
-        if track and track.kalman_filter and len(world_displacements) > 0:
-            avg_displacement = np.mean(world_displacements, axis=0)
-            velocity = avg_displacement / dt
-            track.kalman_filter.predict()
-            track.kalman_filter.update(velocity)
-            filtered_velocity = track.kalman_filter.get_velocity()
-            return float(np.linalg.norm(filtered_velocity) * 3.6)
-        return median_speed
+            speed_ms = float(np.linalg.norm(displacement)) / dt  # m/s
+            speed_kmh = speed_ms * 3.6  # km/h
+            speeds.append(speed_kmh)
+        
+        # Use median speed to reduce noise
+        if speeds:
+            median_speed = float(np.median(speeds))
+            
+            # Update Kalman filter
+            track = self.tracks.get(track_id)
+            if track and track.kalman_filter:
+                # Velocity in X and Z directions
+                if len(world_displacements) > 0:
+                    avg_displacement = np.mean(world_displacements, axis=0)
+                    velocity = avg_displacement / dt
+                    
+                    track.kalman_filter.predict()
+                    track.kalman_filter.update(velocity)
+                    
+                    # Get filtered velocity
+                    filtered_velocity = track.kalman_filter.get_velocity()
+                    filtered_speed = float(np.linalg.norm(filtered_velocity) * 3.6)  # km/h
+                    
+                    return filtered_speed
+            
+            return median_speed
+        
+        return None
 
     def process_frame(self, frame: np.ndarray, timestamp: float, previous_frame: Optional[np.ndarray] = None) -> Dict[str, Any]:
         results = {
