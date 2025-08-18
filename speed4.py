@@ -613,10 +613,12 @@ class VehicleSpeedEstimator:
             speed_ms = float(np.linalg.norm(displacement)) / dt  # m/s
             speed_kmh = speed_ms * 3.6  # km/h
             speeds.append(speed_kmh)
+            print(f"Track {track_id}: feature disp={displacement}, speed={speed_kmh:.1f} km/h")
         
         # Use median speed to reduce noise
         if speeds:
             median_speed = float(np.median(speeds))
+            print(f"Track {track_id}: median_speed = {median_speed:.1f} km/h")
             
             # Update Kalman filter
             track = self.tracks.get(track_id)
@@ -633,6 +635,7 @@ class VehicleSpeedEstimator:
                     filtered_velocity = track.kalman_filter.get_velocity()
                     filtered_speed = float(np.linalg.norm(filtered_velocity) * 3.6)  # km/h
                     
+                    print(f"Track {track_id}: Kalman filtered speed = {filtered_speed:.1f} km/h")
                     return filtered_speed
             
             return median_speed
