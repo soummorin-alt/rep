@@ -533,11 +533,21 @@ class VehicleSpeedEstimator:
                             print("Camera calibrated. Provide reference vehicle for scale calibration.")
         self.calibration_frames += 1
         detections = self.detect_vehicles(frame)
-        if (self.camera_intrinsics is not None and self.homography_ground is not None and self.scale_factor is None and len(detections) > 0):
+        # If camera is calibrated but metric scale is missing, auto-calibrate using the tallest detection
+        if (self.camera_intrinsics is not None and
+            self.homography_ground is not None and
+            self.scale_factor is None and
+            len(detections) > 0):
+            # Choose the tallest bbox as reference
             tallest = max(detections, key=lambda d: (d[3] - d[1]))
             ref_height = self.config.get('reference_vehicle_height', 1.5)
             if self.calibrate_scale(tallest[:4], ref_height):
                 print(f"Scale auto-calibrated using tallest detection and reference height {ref_height}m")
+                # Verify scale was set
+                if self.scale_factor is not None:
+                    print(f"Scale factor set to: {self.scale_factor:.6f}")
+                else:
+                    print("Warning: Scale calibration failed to set scale_factor")
         associated = self.associate_detections_to_tracks(detections, timestamp)
         for track_id, bbox in associated.items():
             track = self.tracks[track_id]
@@ -561,8 +571,9 @@ class VehicleSpeedEstimator:
             }
             results['vehicles'].append(vehicle_result)
         self.cleanup_old_tracks(timestamp)
+        # Update statistics
         self.stats['frames_processed'] += 1
-        self.stats['vehicles_detected'] += len(associated)
+        self.stats['vehicles_detected'] = len(self.tracks)  # Count unique tracks, not cumulative detections
         return results
 
     def trigger_speed_alert(self, track_id: int, speed: float):
@@ -600,8 +611,11 @@ class VehicleSpeedEstimator:
         status_text = "CALIBRATED" if results['calibrated'] else "CALIBRATING..."
         status_color = (0, 255, 0) if results['calibrated'] else (0, 255, 255)
         cv2.putText(annotated, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
-        stats_text = f"Frames: {self.stats['frames_processed']} | Vehicles: {self.stats['vehicles_detected']} | Violations: {self.stats['speed_violations']}"
-        cv2.putText(annotated, stats_text, (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Draw statistics
+        active_tracks = len(self.tracks)
+        stats_text = f"Frames: {self.stats['frames_processed']} | Active Tracks: {active_tracks} | Violations: {self.stats['speed_violations']}"
+        cv2.putText(annotated, stats_text, (10, frame.shape[0] - 20), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         return annotated
 
     def save_results_to_csv(self, results: List[Dict[str, Any]], output_path: str):
