@@ -806,6 +806,20 @@ class VehicleSpeedEstimator:
         
         # Detect vehicles
         detections = self.detect_vehicles(frame)
+
+        # If camera is calibrated but metric scale is missing, auto-calibrate using the tallest detection
+        if (self.camera_intrinsics is not None and
+            self.homography_ground is not None and
+            self.scale_factor is None and
+            len(detections) > 0):
+            try:
+                # Choose the tallest bbox as reference
+                tallest = max(detections, key=lambda d: (d[3] - d[1]))
+                ref_height = self.config.get('reference_vehicle_height', 1.5)
+                if self.calibrate_scale(tallest[:4], ref_height):
+                    print(f"Scale auto-calibrated using tallest detection and reference height {ref_height}m")
+            except Exception:
+                pass
         
         # Associate detections to tracks
         associated = self.associate_detections_to_tracks(detections, timestamp)
