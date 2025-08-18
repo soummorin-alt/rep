@@ -267,26 +267,31 @@ class VehicleSpeedEstimator:
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
+        
+        # Initialize components
         self.vp_detector = DiamondSpaceVPDetector(
             resolution=config.get('diamond_resolution', 512),
             mu=config.get('image_normalization', 1.0)
         )
+        
+        # Camera parameters (will be computed from VP detection)
         self.camera_intrinsics: Optional[CameraIntrinsics] = None
         self.rotation_matrix: Optional[np.ndarray] = None
         self.homography_ground: Optional[np.ndarray] = None
         self.scale_factor: Optional[float] = None
-
+        
         # Vehicle detection (YOLO only)
         if YOLO_AVAILABLE:
             self.vehicle_detector = YOLO('yolov8n.pt')
         else:
             self.vehicle_detector = None
-
+            print("Warning: YOLOv8n not available; vehicle detection disabled.")
+        
         # Tracking
         self.tracks: Dict[int, VehicleTrack] = {}
         self.next_track_id = 1
         self.max_track_age = config.get('max_track_age', 30)
-
+        
         # Feature tracking parameters
         self.feature_params = dict(
             maxCorners=10,
@@ -299,25 +304,28 @@ class VehicleSpeedEstimator:
             maxLevel=3,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
         )
-
+        
         # Speed parameters
         self.speed_threshold = config.get('speed_threshold', 50)
         self.reference_height = config.get('reference_vehicle_height', 1.5)
-
+        
+        # Input speed for testing (when computed speed is zero)
+        self.input_speed = config.get('input_speed', None)
+        
         # Calibration
         self.calibration_frames = 0
         self.recalibration_interval = config.get('recalibration_interval', 30)
-
+        
         # Audio alerts
         if TTS_AVAILABLE:
             self.tts_engine = pyttsx3.init()
             self.tts_engine.setProperty('rate', 150)
-
+        
         # Threading
         self.frame_queue = queue.Queue(maxsize=10)
         self.result_queue = queue.Queue(maxsize=100)
         self.processing_active = False
-
+        
         # Statistics
         self.stats = {
             'frames_processed': 0,
@@ -887,9 +895,25 @@ class VehicleSpeedEstimator:
                     speed = self.track_features_and_estimate_speed(frame, previous_frame, track_id, bbox, timestamp, dt)
             if speed is not None:
                 track.speeds.append(speed)
+                
+                # Trigger alert if speed exceeds threshold
                 if speed > self.speed_threshold:
                     self.trigger_speed_alert(track_id, speed)
                     self.stats['speed_violations'] += 1
+            else:
+                # If computed speed is None/zero and we have input speed, use test speed
+                if self.input_speed is not None and self.input_speed > 0:
+                    test_speed = self.get_test_speed_with_variance(self.input_speed)
+                    track.speeds.append(test_speed)
+                    print(f"Track {track_id}: Using test speed {test_speed:.1f} km/h (input: {self.input_speed} ±7 km/h)")
+                    
+                    # Trigger alert if test speed exceeds threshold
+                    if test_speed > self.speed_threshold:
+                        self.trigger_speed_alert(track_id, test_speed)
+                        self.stats['speed_violations'] += 1
+                    
+                    # Use test speed for display
+                    speed = test_speed
             vehicle_result = {
                 'track_id': track_id,
                 'bbox': bbox,
@@ -969,6 +993,20 @@ class VehicleSpeedEstimator:
             print(f"Scale calibrated with reference vehicle height: {height_meters}m")
             return True
         return False
+
+    def get_test_speed_with_variance(self, base_speed: float, variance_range: float = 7.0) -> float:
+        """Generate a random speed within ±variance_range km/h of the base speed for testing"""
+        if base_speed is None or base_speed <= 0:
+            return 0.0
+        
+        # Generate random variance within ±variance_range
+        variance = np.random.uniform(-variance_range, variance_range)
+        test_speed = base_speed + variance
+        
+        # Ensure speed doesn't go negative
+        test_speed = max(0.0, test_speed)
+        
+        return test_speed
 
 class RealTimeProcessor:
     """Real-time processing wrapper with threading"""
@@ -1111,6 +1149,7 @@ class RealTimeProcessor:
             self.display_thread.join()
 
 def main():
+    """Main function"""
     parser = argparse.ArgumentParser(description='Monocular Vehicle Speed Estimation')
     parser.add_argument('--mode', choices=['camera', 'video'], default='camera', help='Processing mode: camera or video file')
     parser.add_argument('--input', type=str, help='Input video file path (for video mode)')
@@ -1120,8 +1159,11 @@ def main():
     parser.add_argument('--config', type=str, help='Configuration file path')
     parser.add_argument('--reference-height', type=float, default=1.5, help='Reference vehicle height in meters')
     parser.add_argument('--speed-threshold', type=float, default=50, help='Speed violation threshold in km/h')
+    parser.add_argument('--input-speed', type=float, help='Input speed in km/h for testing when computed speed is zero')
+    
     args = parser.parse_args()
-
+    
+    # Load configuration
     config = {
         'diamond_resolution': 512,
         'image_normalization': 1.0,
@@ -1129,7 +1171,8 @@ def main():
         'recalibration_interval': 30,
         'reference_vehicle_height': args.reference_height,
         'speed_threshold': args.speed_threshold,
-        'camera_height': 1.7
+        'camera_height': 1.7,
+        'input_speed': args.input_speed
     }
     if args.config:
         try:
