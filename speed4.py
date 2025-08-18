@@ -444,9 +444,12 @@ class VehicleSpeedEstimator:
         if len(vanishing_points) < 3:
             return False
         h, w = img_shape[:2]
-        (u1, v1), _ = vanishing_points[0]
-        (u2, v2), _ = vanishing_points[1]
-        (u3, v3), _ = vanishing_points[2]
+        # Each vanishing point is stored as a homogeneous coordinate [u, v, 1.0]
+        # Only the first two components are needed here
+        (vp1, _), (vp2, _), (vp3, _) = vanishing_points[:3]
+        u1, v1 = vp1[:2]
+        u2, v2 = vp2[:2]
+        u3, v3 = vp3[:2]
 
         from scipy.optimize import least_squares
 
