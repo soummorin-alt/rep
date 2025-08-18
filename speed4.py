@@ -708,15 +708,21 @@ class VehicleSpeedEstimator:
         # Filter good features
         good_mask = (status.flatten() == 1) & (status_back.flatten() == 1)
         if np.any(good_mask):
-            fb_error = np.linalg.norm(features[good_mask] - back_features[good_mask], axis=2).flatten()
-            good_mask[good_mask] = fb_error < 3.0
-        
-        if not np.any(good_mask):
+            prev_good = features[good_mask].reshape(-1, 2)
+            back_good = back_features[good_mask].reshape(-1, 2)
+            fb_error = np.linalg.norm(prev_good - back_good, axis=1)
+            # Keep only those with low forward-backward error
+            refined_mask = fb_error < 3.0
+            if not np.any(refined_mask):
+                return None
+            prev_good = prev_good[refined_mask]
+            curr_good = new_features[good_mask].reshape(-1, 2)[refined_mask]
+        else:
             return None
         
         # Convert to image coordinates (add ROI offset)
-        features_img = features[good_mask] + [x1, y1]
-        new_features_img = new_features[good_mask] + [x1, y1]
+        features_img = prev_good + np.array([x1, y1], dtype=np.float32)
+        new_features_img = curr_good + np.array([x1, y1], dtype=np.float32)
         
         # Project to world coordinates
         world_displacements = []
@@ -724,8 +730,8 @@ class VehicleSpeedEstimator:
         for (f1, f2) in zip(features_img, new_features_img):
             try:
                 # Project to ground plane
-                p1_homo = np.array([f1[0], f1[1], 1.0])
-                p2_homo = np.array([f2[0], f2[1], 1.0])
+                p1_homo = np.array([float(f1[0]), float(f1[1]), 1.0], dtype=np.float32)
+                p2_homo = np.array([float(f2[0]), float(f2[1]), 1.0], dtype=np.float32)
                 
                 # Use homography to project to ground plane
                 if self.homography_ground is not None:
