@@ -560,13 +560,18 @@ class VehicleSpeedEstimator:
     def detect_vehicles(self, image: np.ndarray) -> List[Tuple[int,int,int,int,float]]:
         detections = []
         if YOLO_AVAILABLE and hasattr(self, 'vehicle_detector'):
-            # Instead of indexing, do:
-            results = self.vehicle_detector(image, conf=0.4, classes=[2,5,7])
-            # results is a Results object
-            for box in results.boxes:
-                x1, y1, x2, y2 = box.xyxy.cpu().numpy()
-                conf = box.conf.cpu().numpy()
-                detections.append((int(x1), int(y1), int(x2), int(y2), float(conf)))
+            # Handle both single Results object and list of Results across ultralytics versions
+            results = self.vehicle_detector(image, conf=0.4, classes=[2, 5, 7])
+            results_list = results if isinstance(results, list) else [results]
+
+            for r in results_list:
+                if not hasattr(r, 'boxes') or r.boxes is None:
+                    continue
+                # r.boxes is a Boxes object with tensors
+                xyxy = r.boxes.xyxy.cpu().numpy() if hasattr(r.boxes, 'xyxy') else np.empty((0, 4))
+                confs = r.boxes.conf.cpu().numpy() if hasattr(r.boxes, 'conf') else np.ones((xyxy.shape[0],), dtype=np.float32)
+                for (x1, y1, x2, y2), conf in zip(xyxy, confs):
+                    detections.append((int(x1), int(y1), int(x2), int(y2), float(conf)))
 
         else:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
