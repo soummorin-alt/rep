@@ -544,14 +544,21 @@ class VehicleSpeedEstimator:
         features_img = prev_good + np.array([x1, y1], dtype=np.float32)
         new_features_img = curr_good + np.array([x1, y1], dtype=np.float32)
         
+        # Debug: print pixel displacements in ROI
+        for i in range(len(prev_good)):
+            pixel_disp = curr_good[i] - prev_good[i]
+            print(f"Track {track_id}: pixel disp={pixel_disp} px")
+        
         # Project to world coordinates
         world_displacements = []
         
-        for (f1, f2) in zip(features_img, new_features_img):
+        for i, (f1, f2) in enumerate(zip(features_img, new_features_img)):
             try:
                 # Project to ground plane
                 p1_homo = np.array([float(f1[0]), float(f1[1]), 1.0], dtype=np.float32)
                 p2_homo = np.array([float(f2[0]), float(f2[1]), 1.0], dtype=np.float32)
+                
+                print(f"Feature {i}: img1 {f1}, img2 {f2}")
                 
                 # Use homography to project to ground plane
                 if self.homography_ground is not None:
@@ -563,16 +570,45 @@ class VehicleSpeedEstimator:
                     world_p1 = world_p1 / world_p1[2] if abs(world_p1[2]) > 1e-6 else world_p1
                     world_p2 = world_p2 / world_p2[2] if abs(world_p2[2]) > 1e-6 else world_p2
                     
+                    print(f"World p1: {world_p1}, World p2: {world_p2}, diff: {world_p2-world_p1}")
+                    
                     # Apply scale factor
                     if self.scale_factor is not None:
+                        print(f"scale_factor: {self.scale_factor}")
                         displacement = (world_p2[:2] - world_p1[:2]) * self.scale_factor
+                        print(f"Scaled displacement: {displacement}")
                         world_displacements.append(displacement)
+                    else:
+                        print("Warning: scale_factor is None!")
+                else:
+                    print("Warning: homography_ground is None!")
             
-            except (np.linalg.LinAlgError, ZeroDivisionError):
+            except (np.linalg.LinAlgError, ZeroDivisionError) as e:
+                print(f"Error processing feature {i}: {e}")
                 continue
         
         # Debug: print number of valid ground displacements
         print(f"Track {track_id}: {len(world_displacements)} valid ground displacements.")
+        
+        # Debug: validate homography and scale factor
+        if self.homography_ground is not None:
+            print(f"Homography matrix:\n{self.homography_ground}")
+            # Check if homography is degenerate
+            det = np.linalg.det(self.homography_ground)
+            print(f"Homography determinant: {det}")
+            if abs(det) < 1e-10:
+                print("WARNING: Homography is nearly singular!")
+        else:
+            print("ERROR: No homography available!")
+            
+        if self.scale_factor is not None:
+            print(f"Scale factor: {self.scale_factor}")
+            if abs(self.scale_factor) < 1e-10:
+                print("WARNING: Scale factor is nearly zero!")
+            elif np.isnan(self.scale_factor) or np.isinf(self.scale_factor):
+                print("ERROR: Scale factor is NaN or Inf!")
+        else:
+            print("ERROR: No scale factor available!")
         
         if not world_displacements:
             # Fallback: use center-of-bbox motion if no features available
