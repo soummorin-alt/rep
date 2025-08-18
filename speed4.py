@@ -318,14 +318,25 @@ class VehicleSpeedEstimator:
         return True
 
     def compute_ground_homography(self) -> bool:
+        """Compute homography mapping the world ground plane (Y=0) to image plane."""
         if self.camera_intrinsics is None or self.rotation_matrix is None:
             return False
+
         K = self.camera_intrinsics.K
         R = self.rotation_matrix
-        h_cam = self.config.get('camera_height', 1.7)
+        h_cam = self.config.get('camera_height', 1.7)  # meters
+
+        # Use first two columns of R (X and Z world axes) and translation [0, h_cam, 0]
         t = np.array([0.0, h_cam, 0.0], dtype=np.float32)
         H_ground = K @ np.column_stack([R[:, 0], R[:, 1], t])
+
+        # Verify homography is reasonable
+        if np.any(np.isnan(H_ground)) or np.any(np.isinf(H_ground)):
+            print(f"Warning: Invalid homography computed. Camera height: {h_cam}m")
+            return False
+
         self.homography_ground = H_ground
+        print(f"Ground homography computed with camera height: {h_cam}m")
         return True
 
     def compute_rotation_matrix(self, vanishing_points: List[Tuple[np.ndarray, float]]):
@@ -343,31 +354,56 @@ class VehicleSpeedEstimator:
             self.rotation_matrix = np.column_stack([d1, d2, d3])
 
     def calibrate_scale(self, reference_bbox: Tuple[int, int, int, int], reference_height: float) -> bool:
+        """Calibrate metric scale using reference vehicle with least squares solver"""
         if self.camera_intrinsics is None or self.rotation_matrix is None:
             return False
+        
         x1, y1, x2, y2 = reference_bbox
+        
+        # Use top and bottom center of bounding box
         u_top, v_top = (x1 + x2) / 2, y1
         u_bot, v_bot = (x1 + x2) / 2, y2
+        
         K_inv = np.linalg.inv(self.camera_intrinsics.K)
         R = self.rotation_matrix
-        p_bot = K_inv @ np.array([u_bot, v_bot, 1.0])
-        p_top = K_inv @ np.array([u_top, v_top, 1.0])
-        A = np.zeros((6, 4)); b = np.zeros(6)
-        A[0:3, 0] = p_bot
-        A[0:3, 2] = -R[:, 0]
-        A[0:3, 3] = -R[:, 2]
-        A[3:6, 1] = p_top
-        A[3:6, 2] = -R[:, 0]
-        A[3:6, 3] = -R[:, 2]
-        b[3:6] = R[:, 1] * reference_height
+        
+        # Back-project points to normalized camera coordinates
+        p_bot = K_inv @ np.array([u_bot, v_bot, 1.0])  # K⁻¹ [u_b, v_b, 1]^T
+        p_top = K_inv @ np.array([u_top, v_top, 1.0])  # K⁻¹ [u_t, v_t, 1]^T
+        
+        # Set up system: λ_bot * p_bot = R [X, 0, Z]^T
+        #                λ_top * p_top = R [X, H, Z]^T  
+        # Rearranged: λ_bot * p_bot - R @ [X, 0, Z]^T = 0
+        #            λ_top * p_top - R @ [X, H, Z]^T = 0
+        
+        # Build 6×4 system for [λ_bot, λ_top, X, Z]:
+        A = np.zeros((6,4)); b = np.zeros(6)
+        # λ_bot * p_bot = R @ [X,0,Z]^T
+        A[0:3,0] = p_bot
+        A[0:3,2] = -R[:,0]
+        A[0:3,3] = -R[:,2]
+        # λ_top * p_top = R @ [X,H,Z]^T
+        A[3:6,1] = p_top
+        A[3:6,2] = -R[:,0]
+        A[3:6,3] = -R[:,2]
+        b[3:6] = R[:,1] * reference_height
+
         sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
         lam_bot, lam_top, X, Z = sol
+        
+        # Verify solution is reasonable
+        if abs(lam_bot) < 1e-6 or abs(lam_top) < 1e-6:
+            print(f"Warning: Scale calibration failed - invalid lambda values: λ_bot={lam_bot:.2e}, λ_top={lam_top:.2e}")
+            return False
+            
         P_bot = lam_bot * p_bot
         P_top = lam_top * p_top
         world_height = np.linalg.norm(P_top - P_bot)
         if world_height > 1e-6:
-            self.scale_factor = reference_height / world_height
-            return True
+           self.scale_factor = reference_height / world_height
+           print(f"Scale calibration successful: world_height={world_height:.6f}m, scale_factor={self.scale_factor:.6f}")
+           return True
+        print(f"Warning: Scale calibration failed - computed world height too small: {world_height:.2e}m")
         return False
 
     def _detect_with_yolo(self, image: np.ndarray) -> List[Tuple[int, int, int, int, float]]:
@@ -527,8 +563,19 @@ class VehicleSpeedEstimator:
                 vanishing_points = self.vp_detector.find_vanishing_points(3)
                 results['vanishing_points'] = [(vp.tolist(), score) for vp, score in vanishing_points]
                 if len(vanishing_points) >= 2:
+                    # Compute camera intrinsics
                     if self.compute_camera_intrinsics(vanishing_points, frame.shape):
+                        # Debug output for K and R
+                        print(f"Camera intrinsics K:\n{self.camera_intrinsics.K}")
+                        if self.rotation_matrix is not None:
+                            print(f"Rotation matrix R:\n{self.rotation_matrix}")
+                            print(f"R orthogonality check: R^T @ R =\n{self.rotation_matrix.T @ self.rotation_matrix}")
+                        
+                        # Compute ground homography
                         self.compute_ground_homography()
+                        
+                        # If this is the first calibration and no scale set, 
+                        # we need user to provide reference vehicle
                         if self.scale_factor is None:
                             print("Camera calibrated. Provide reference vehicle for scale calibration.")
         self.calibration_frames += 1
