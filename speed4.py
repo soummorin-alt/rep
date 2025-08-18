@@ -317,6 +317,53 @@ class VehicleSpeedEstimator:
         self.compute_rotation_matrix(vanishing_points)
         return True
 
+    def compute_rotation_matrix(self, vanishing_points: List[Tuple[np.ndarray, float]]):
+        """Compute camera rotation matrix from vanishing points"""
+        K = self.camera_intrinsics.K
+        K_inv = np.linalg.inv(K)
+        
+        # Convert vanishing points to normalized coordinates
+        dirs = []
+        for vp, _ in vanishing_points[:3]:
+            vp_norm = K_inv @ vp
+            dirs.append(vp_norm / np.linalg.norm(vp_norm))
+        
+        # Orthogonalize using Gram-Schmidt
+        if len(dirs) >= 2:
+            d1 = dirs[0]
+            d2 = dirs[1] - np.dot(dirs[1], d1) * d1
+            d2 = d2 / np.linalg.norm(d2)
+            d3 = np.cross(d1, d2)
+            
+            self.rotation_matrix = np.column_stack([d1, d2, d3])
+            
+            # Validate rotation matrix
+            R = self.rotation_matrix
+            RTR = R.T @ R
+            print("Rotation matrix R:")
+            print(R)
+            print("R^T @ R =")
+            print(RTR)
+            
+            # Check orthogonality
+            identity_diff = np.abs(RTR - np.eye(3))
+            max_deviation = np.max(identity_diff)
+            print(f"Max deviation from identity: {max_deviation:.2e}")
+            
+            if max_deviation > 1e-3:
+                print("WARNING: Rotation matrix is not properly orthogonal!")
+                return False
+            
+            # Check determinant
+            det = np.linalg.det(R)
+            print(f"Rotation matrix determinant: {det:.6f}")
+            if abs(det - 1.0) > 1e-3:
+                print("WARNING: Rotation matrix determinant is not 1.0!")
+                return False
+                
+            return True
+        return False
+
     def compute_ground_homography(self) -> bool:
         """Compute homography mapping the world ground plane (Y=0) to image plane."""
         if self.camera_intrinsics is None or self.rotation_matrix is None:
@@ -330,28 +377,53 @@ class VehicleSpeedEstimator:
         t = np.array([0.0, h_cam, 0.0], dtype=np.float32)
         H_ground = K @ np.column_stack([R[:, 0], R[:, 1], t])
 
-        # Verify homography is reasonable
-        if np.any(np.isnan(H_ground)) or np.any(np.isinf(H_ground)):
-            print(f"Warning: Invalid homography computed. Camera height: {h_cam}m")
+        # Strict homography validation
+        det = np.linalg.det(H_ground)
+        print(f"Homography determinant: {det:.2e}")
+        
+        if abs(det) < 1e-6:
+            print("ERROR: Homography is nearly singular! Recalibration needed.")
             return False
+            
+        if np.any(np.isnan(H_ground)) or np.any(np.isinf(H_ground)):
+            print(f"ERROR: Invalid homography computed. Camera height: {h_cam}m")
+            return False
+
+        # Test homography with sample image points
+        h, w = self.config.get('image_shape', (480, 640))
+        test_points = [
+            (w//2, h//2),      # center
+            (w//4, h//4),      # top-left quadrant
+            (3*w//4, 3*h//4),  # bottom-right quadrant
+            (w//2, h-50)       # near bottom center
+        ]
+        
+        print("Testing homography with sample image points:")
+        world_points = []
+        for x, y in test_points:
+            p_homo = np.array([x, y, 1.0])
+            try:
+                H_inv = np.linalg.inv(H_ground)
+                world_p = H_inv @ p_homo
+                world_p = world_p / world_p[2] if abs(world_p[2]) > 1e-6 else world_p
+                world_points.append(world_p[:2])
+                print(f"  Image ({x}, {y}) -> World ({world_p[0]:.3f}, {world_p[1]:.3f})")
+            except np.linalg.LinAlgError:
+                print(f"  Image ({x}, {y}) -> ERROR")
+                return False
+        
+        # Check if world points vary (not all the same)
+        if len(world_points) > 1:
+            world_array = np.array(world_points)
+            variance = np.var(world_array, axis=0)
+            print(f"World coordinates variance: {variance}")
+            if np.any(variance < 1e-6):
+                print("WARNING: World coordinates show very little variation!")
+                return False
 
         self.homography_ground = H_ground
         print(f"Ground homography computed with camera height: {h_cam}m")
         return True
-
-    def compute_rotation_matrix(self, vanishing_points: List[Tuple[np.ndarray, float]]):
-        K = self.camera_intrinsics.K
-        K_inv = np.linalg.inv(K)
-        dirs = []
-        for vp, _ in vanishing_points[:3]:
-            vp_norm = K_inv @ vp
-            dirs.append(vp_norm / np.linalg.norm(vp_norm))
-        if len(dirs) >= 2:
-            d1 = dirs[0]
-            d2 = dirs[1] - np.dot(dirs[1], d1) * d1
-            d2 = d2 / np.linalg.norm(d2)
-            d3 = np.cross(d1, d2)
-            self.rotation_matrix = np.column_stack([d1, d2, d3])
 
     def calibrate_scale(self, reference_bbox: Tuple[int, int, int, int], reference_height: float) -> bool:
         """Calibrate metric scale using reference vehicle with least squares solver"""
@@ -693,6 +765,26 @@ class VehicleSpeedEstimator:
                 vanishing_points = self.vp_detector.find_vanishing_points(3)
                 results['vanishing_points'] = [(vp.tolist(), score) for vp, score in vanishing_points]
                 if len(vanishing_points) >= 2:
+                    # Inspect vanishing points for calibration
+                    print("Vanishing points used for calibration:")
+                    for i, (vp, score) in enumerate(vanishing_points[:3]):
+                        print(f"  VP{i+1} = {vp}, score = {score}")
+                    
+                    # Check spatial distribution of vanishing points
+                    if len(vanishing_points) >= 3:
+                        vp_coords = np.array([vp[:2] for vp, _ in vanishing_points[:3]])
+                        distances = []
+                        for i in range(3):
+                            for j in range(i+1, 3):
+                                dist = np.linalg.norm(vp_coords[i] - vp_coords[j])
+                                distances.append(dist)
+                                print(f"  Distance VP{i+1}-VP{j+1}: {dist:.1f} pixels")
+                        
+                        min_dist = min(distances)
+                        if min_dist < 100:  # pixels
+                            print(f"WARNING: Vanishing points too close (min distance: {min_dist:.1f} px)")
+                            print("Consider recalibration with better distributed vanishing points")
+                    
                     # Compute camera intrinsics
                     if self.compute_camera_intrinsics(vanishing_points, frame.shape):
                         # Debug output for K and R
@@ -702,12 +794,14 @@ class VehicleSpeedEstimator:
                             print(f"R orthogonality check: R^T @ R =\n{self.rotation_matrix.T @ self.rotation_matrix}")
                         
                         # Compute ground homography
-                        self.compute_ground_homography()
-                        
-                        # If this is the first calibration and no scale set, 
-                        # we need user to provide reference vehicle
-                        if self.scale_factor is None:
-                            print("Camera calibrated. Provide reference vehicle for scale calibration.")
+                        if self.compute_ground_homography():
+                            # If this is the first calibration and no scale set, 
+                            # we need user to provide reference vehicle
+                            if self.scale_factor is None:
+                                print("Camera calibrated. Provide reference vehicle for scale calibration.")
+                        else:
+                            print("ERROR: Ground homography computation failed!")
+                            self.homography_ground = None
         self.calibration_frames += 1
         detections = self.detect_vehicles(frame)
         # If camera is calibrated but metric scale is missing, auto-calibrate using the tallest detection
