@@ -817,6 +817,7 @@ class VehicleSpeedEstimator:
                         print(f"  VP{i+1} = {vp}, score = {score}")
                     
                     # Check spatial distribution of vanishing points
+                    proceed_with_calibration = True
                     if len(vanishing_points) >= 3:
                         vp_coords = np.array([vp[:2] for vp, _ in vanishing_points[:3]])
                         distances = []
@@ -830,29 +831,33 @@ class VehicleSpeedEstimator:
                         if min_dist < 50:  # pixels
                             print(f"ERROR: Vanishing points too close (min distance: {min_dist:.1f} px)")
                             print("Insufficiently distributed vanishing points—skipping calibration step.")
-                            continue  # Skip to next frame instead of proceeding with bad calibration
+                            proceed_with_calibration = False
                     
-                    # Compute camera intrinsics
-                    if self.compute_camera_intrinsics(vanishing_points, frame.shape):
-                        # Debug output for K and R
-                        print(f"Camera intrinsics K:\n{self.camera_intrinsics.K}")
-                        if self.rotation_matrix is not None:
-                            print(f"Rotation matrix R:\n{self.rotation_matrix}")
-                            print(f"R orthogonality check: R^T @ R =\n{self.rotation_matrix.T @ self.rotation_matrix}")
-                        
-                        # Compute ground homography
-                        if self.compute_ground_homography():
-                            # If this is the first calibration and no scale set, 
-                            # we need user to provide reference vehicle
-                            if self.scale_factor is None:
-                                print("Camera calibrated. Provide reference vehicle for scale calibration.")
+                    # Only proceed with calibration if spatial diversity is sufficient
+                    if proceed_with_calibration:
+                        # Compute camera intrinsics
+                        if self.compute_camera_intrinsics(vanishing_points, frame.shape):
+                            # Debug output for K and R
+                            print(f"Camera intrinsics K:\n{self.camera_intrinsics.K}")
+                            if self.rotation_matrix is not None:
+                                print(f"Rotation matrix R:\n{self.rotation_matrix}")
+                                print(f"R orthogonality check: R^T @ R =\n{self.rotation_matrix.T @ self.rotation_matrix}")
+                            
+                            # Compute ground homography
+                            if self.compute_ground_homography():
+                                # If this is the first calibration and no scale set, 
+                                # we need user to provide reference vehicle
+                                if self.scale_factor is None:
+                                    print("Camera calibrated. Provide reference vehicle for scale calibration.")
+                            else:
+                                print("ERROR: Ground homography computation failed!")
+                                self.homography_ground = None
                         else:
-                            print("ERROR: Ground homography computation failed!")
-                            self.homography_ground = None
+                            print("ERROR: Camera intrinsics computation failed!")
+                            self.camera_intrinsics = None
+                            self.rotation_matrix = None
                     else:
-                        print("ERROR: Camera intrinsics computation failed!")
-                        self.camera_intrinsics = None
-                        self.rotation_matrix = None
+                        print("Skipping calibration due to insufficient vanishing point distribution.")
         self.calibration_frames += 1
         detections = self.detect_vehicles(frame)
         # If camera is calibrated but metric scale is missing, auto-calibrate using the tallest detection
