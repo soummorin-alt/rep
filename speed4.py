@@ -312,6 +312,9 @@ class VehicleSpeedEstimator:
         # Input speed for testing (when computed speed is zero)
         self.input_speed = config.get('input_speed', None)
         
+        # Verbose logging flag
+        self.verbose = config.get('verbose', False)
+        
         # Calibration
         self.calibration_frames = 0
         self.recalibration_interval = config.get('recalibration_interval', 30)
@@ -814,58 +817,79 @@ class VehicleSpeedEstimator:
         # Recalibrate only until scale is set
         if (self.scale_factor is None) and (self.calibration_frames % self.recalibration_interval == 0 or self.camera_intrinsics is None):
             edgelets = self.extract_edgelets(frame)
-            if len(edgelets) > 100:
-                self.vp_detector.accumulate_edgelets(edgelets, frame.shape)
-                vanishing_points = self.vp_detector.find_vanishing_points(3)
-                results['vanishing_points'] = [(vp.tolist(), score) for vp, score in vanishing_points]
-                if len(vanishing_points) >= 2:
-                    # Inspect vanishing points for calibration
-                    print("Vanishing points used for calibration:")
-                    for i, (vp, score) in enumerate(vanishing_points[:3]):
-                        print(f"  VP{i+1} = {vp}, score = {score}")
+            if len(edgelets) > 100:  # Minimum edgelets for reliable VP detection
+                # Assess scene quality before proceeding
+                scene_assessment = self.assess_scene_quality(edgelets, frame.shape)
+                
+                if scene_assessment['suitable']:
+                    # Scene has good structure, use diamond space method
+                    self.vp_detector.accumulate_edgelets(edgelets, frame.shape)
+                    vanishing_points = self.vp_detector.find_vanishing_points(3)
                     
-                    # Check spatial distribution of vanishing points
-                    proceed_with_calibration = True
-                    if len(vanishing_points) >= 3:
-                        vp_coords = np.array([vp[:2] for vp, _ in vanishing_points[:3]])
-                        distances = []
-                        for i in range(3):
-                            for j in range(i+1, 3):
-                                dist = np.linalg.norm(vp_coords[i] - vp_coords[j])
-                                distances.append(dist)
-                                print(f"  Distance VP{i+1}-VP{j+1}: {dist:.1f} pixels")
+                    if self.verbose:
+                        print(f"Diamond space successful: {len(vanishing_points)} VPs")
+                    
+                    if len(vanishing_points) >= 2:
+                        results['vanishing_points'] = [(vp.tolist(), score) for vp, score in vanishing_points]
                         
-                        min_dist = min(distances)
-                        if min_dist < 50:  # pixels
-                            print(f"ERROR: Vanishing points too close (min distance: {min_dist:.1f} px)")
-                            print("Insufficiently distributed vanishing points—skipping calibration step.")
-                            proceed_with_calibration = False
-                    
-                    # Only proceed with calibration if spatial diversity is sufficient
-                    if proceed_with_calibration:
-                        # Compute camera intrinsics
-                        if self.compute_camera_intrinsics(vanishing_points, frame.shape):
-                            # Debug output for K and R
-                            print(f"Camera intrinsics K:\n{self.camera_intrinsics.K}")
-                            if self.rotation_matrix is not None:
-                                print(f"Rotation matrix R:\n{self.rotation_matrix}")
-                                print(f"R orthogonality check: R^T @ R =\n{self.rotation_matrix.T @ self.rotation_matrix}")
+                        # Inspect vanishing points for calibration
+                        if self.verbose:
+                            print("Vanishing points used for calibration:")
+                            for i, (vp, score) in enumerate(vanishing_points[:3]):
+                                print(f"  VP{i+1} = {vp}, score = {score}")
+                        
+                        # Check spatial distribution of vanishing points
+                        proceed_with_calibration = True
+                        if len(vanishing_points) >= 3:
+                            vp_coords = np.array([vp[:2] for vp, _ in vanishing_points[:3]])
+                            distances = []
+                            for i in range(3):
+                                for j in range(i+1, 3):
+                                    dist = np.linalg.norm(vp_coords[i] - vp_coords[j])
+                                    distances.append(dist)
+                                    if self.verbose:
+                                        print(f"  Distance VP{i+1}-VP{j+1}: {dist:.1f} pixels")
                             
-                            # Compute ground homography
-                            if self.compute_ground_homography():
-                                # If this is the first calibration and no scale set, 
-                                # we need user to provide reference vehicle
-                                if self.scale_factor is None:
-                                    print("Camera calibrated. Provide reference vehicle for scale calibration.")
+                            min_dist = min(distances)
+                            if min_dist < 50:  # pixels
+                                print(f"ERROR: Vanishing points too close (min distance: {min_dist:.1f} px)")
+                                print("Insufficiently distributed vanishing points—skipping calibration step.")
+                                proceed_with_calibration = False
+                        
+                        # Only proceed with calibration if spatial diversity is sufficient
+                        if proceed_with_calibration:
+                            # Compute camera intrinsics
+                            if self.compute_camera_intrinsics(vanishing_points, frame.shape):
+                                # Debug output for K and R
+                                if self.verbose:
+                                    print(f"Camera intrinsics K:\n{self.camera_intrinsics.K}")
+                                    if self.rotation_matrix is not None:
+                                        print(f"Rotation matrix R:\n{self.rotation_matrix}")
+                                        print(f"R orthogonality check: R^T @ R =\n{self.rotation_matrix.T @ self.rotation_matrix}")
+                                
+                                # Compute ground homography
+                                if self.compute_ground_homography():
+                                    # If this is the first calibration and no scale set, 
+                                    # we need user to provide reference vehicle
+                                    if self.scale_factor is None:
+                                        print("Camera calibrated. Provide reference vehicle for scale calibration.")
+                                else:
+                                    print("ERROR: Ground homography computation failed!")
+                                    self.homography_ground = None
                             else:
-                                print("ERROR: Ground homography computation failed!")
-                                self.homography_ground = None
+                                print("ERROR: Camera intrinsics computation failed!")
+                                self.camera_intrinsics = None
+                                self.rotation_matrix = None
                         else:
-                            print("ERROR: Camera intrinsics computation failed!")
-                            self.camera_intrinsics = None
-                            self.rotation_matrix = None
+                            print("Skipping calibration due to insufficient vanishing point distribution.")
                     else:
-                        print("Skipping calibration due to insufficient vanishing point distribution.")
+                        if self.verbose:
+                            print(f"Diamond space found only {len(vanishing_points)} VPs, need at least 2")
+                else:
+                    # Scene lacks structure, skip VP detection
+                    if self.verbose:
+                        print(f"Scene not suitable for VP detection: {scene_assessment['reason']}")
+                    # Don't force bypass - wait for better scene structure
         self.calibration_frames += 1
         detections = self.detect_vehicles(frame)
         # If camera is calibrated but metric scale is missing, auto-calibrate using the tallest detection
@@ -1007,6 +1031,92 @@ class VehicleSpeedEstimator:
         test_speed = max(0.0, test_speed)
         
         return test_speed
+
+    def assess_scene_quality(self, edgelets: np.ndarray, image_shape: Tuple[int, int]) -> Dict[str, Any]:
+        """Assess scene quality for vanishing point detection"""
+        if len(edgelets) == 0:
+            return {'suitable': False, 'reason': 'No edgelets detected'}
+        
+        h, w = image_shape[:2]
+        total_pixels = h * w
+        edge_density = len(edgelets) / total_pixels
+        
+        # Improved Hough line detection with better thresholds
+        min_line_length = max(50, min(h, w) // 20)  # Focus on strong structural lines
+        threshold = max(5, len(edgelets) // 1000)   # Lower threshold to pick up few long lines
+        
+        # Convert edgelets to binary image for Hough transform
+        edge_image = np.zeros((h, w), dtype=np.uint8)
+        for x, y in edgelets.astype(int):
+            if 0 <= x < w and 0 <= y < h:
+                edge_image[y, x] = 255
+        
+        # Detect lines using Hough transform
+        lines = cv2.HoughLinesP(edge_image, 1, np.pi/180, threshold, 
+                               minLineLength=min_line_length, maxLineGap=10)
+        
+        if lines is None:
+            lines = []
+        
+        num_lines = len(lines)
+        
+        # Calculate line diversity (how many dominant orientations)
+        if num_lines >= 3:
+            angles = []
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                angle = np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi
+                # Normalize to 0-180 degrees
+                angle = angle % 180
+                angles.append(angle)
+            
+            # Cluster angles into dominant orientations
+            angle_bins = np.zeros(18)  # 10-degree bins
+            for angle in angles:
+                bin_idx = int(angle // 10)
+                angle_bins[bin_idx] += 1
+            
+            # Count peaks in angle histogram
+            peaks = 0
+            for i in range(1, 17):  # Skip edge bins
+                if angle_bins[i] > angle_bins[i-1] and angle_bins[i] > angle_bins[i+1]:
+                    if angle_bins[i] > len(angles) * 0.1:  # Peak must be >10% of lines
+                        peaks += 1
+            
+            line_diversity = min(peaks / 3.0, 1.0)  # Normalize to ideal 3 orientations
+        else:
+            line_diversity = 0.0
+        
+        # Calculate structural strength
+        if num_lines > 0:
+            line_lengths = []
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+                line_lengths.append(length)
+            
+            avg_length = np.mean(line_lengths)
+            max_possible_length = np.sqrt(h**2 + w**2)
+            length_ratio = avg_length / max_possible_length
+            structural_strength = length_ratio * (num_lines / 20.0)
+        else:
+            structural_strength = 0.0
+        
+        # Determine if scene is suitable for VP detection
+        suitable = (num_lines >= 3 and line_diversity >= 0.3 and structural_strength >= 0.01)
+        
+        if self.verbose:
+            print(f"Scene assessment: edge_density={edge_density:.3f}, num_lines={num_lines}, "
+                  f"line_diversity={line_diversity:.2f}, structural_strength={structural_strength:.3f}")
+        
+        return {
+            'suitable': suitable,
+            'edge_density': edge_density,
+            'num_lines': num_lines,
+            'line_diversity': line_diversity,
+            'structural_strength': structural_strength,
+            'reason': 'Insufficient line structures' if not suitable else 'Scene suitable for VP detection'
+        }
 
 class RealTimeProcessor:
     """Real-time processing wrapper with threading"""
@@ -1160,6 +1270,7 @@ def main():
     parser.add_argument('--reference-height', type=float, default=1.5, help='Reference vehicle height in meters')
     parser.add_argument('--speed-threshold', type=float, default=50, help='Speed violation threshold in km/h')
     parser.add_argument('--input-speed', type=float, help='Input speed in km/h for testing when computed speed is zero')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose logging for debugging')
     
     args = parser.parse_args()
     
@@ -1172,7 +1283,8 @@ def main():
         'reference_vehicle_height': args.reference_height,
         'speed_threshold': args.speed_threshold,
         'camera_height': 1.7,
-        'input_speed': args.input_speed
+        'input_speed': args.input_speed,
+        'verbose': args.verbose
     }
     if args.config:
         try:
