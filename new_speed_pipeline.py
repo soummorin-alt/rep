@@ -56,29 +56,14 @@ class KalmanFilter1D:
 
 
 class MiDaSDepthEstimator:
+    """Optional depth estimator placeholder (not used for scale in this pipeline)."""
     def __init__(self, model_type: str = "DPT_Hybrid"):
-        try:
-            import torch.hub
-            self.model = torch.hub.load("intel/MiDaS", model_type)
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.model.to(self.device).eval()
-            midas_transforms = torch.hub.load("intel/MiDaS", "transforms")
-            self.transform = midas_transforms.dpt_transform if model_type == "DPT_Hybrid" else midas_transforms.default_transform
-            logger.info(f"Loaded MiDaS {model_type} on {self.device}")
-        except Exception as e:
-            logger.error(f"Failed to load MiDaS: {e}")
-            raise
-
+        self.model = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info("MiDaS depth is not used for scale in this pipeline; skipping load.")
     def estimate_depth(self, frame: np.ndarray) -> np.ndarray:
-        input_batch = self.transform(frame).to(self.device)
-        with torch.no_grad():
-            prediction = self.model(input_batch)
-            prediction = torch.nn.functional.interpolate(
-                prediction.unsqueeze(1), size=frame.shape[:2], mode="bicubic", align_corners=False
-            ).squeeze()
-        depth_map = prediction.cpu().numpy()
-        depth_map = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-        return depth_map.astype(np.float32) / 255.0
+        h, w = frame.shape[:2]
+        return np.zeros((h, w), dtype=np.float32)
 
 
 class RAFTOpticalFlow:
@@ -213,6 +198,7 @@ class ByteTracker:
 
 class VehicleSpeedEstimator:
     def __init__(self, video_path: Optional[str] = None, camera_id: int = 0, output_path: str = "output_speed_estimation.mp4"):
+        # Depth estimator currently not used for scale; keep placeholder
         self.depth_estimator = MiDaSDepthEstimator()
         self.flow_estimator = RAFTOpticalFlow()
         self.vp_detector = DeepVanishingPoint()
@@ -226,6 +212,7 @@ class VehicleSpeedEstimator:
         self.frame_count = 0
         self.recalibration_interval = 30
         self.speed_log: List[Dict] = []
+        self.dt: float = 1.0 / 30.0
         logger.info("VehicleSpeedEstimator initialized")
 
     def calibrate_camera(self, vanishing_points: np.ndarray, frame_shape: Tuple[int, int, int]):
@@ -246,7 +233,7 @@ class VehicleSpeedEstimator:
         self.camera_params.homography = H
         return K, H
 
-    def compute_scale_factor(self, depth_map: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
+    def compute_scale_factor(self, bbox: Tuple[int, int, int, int]) -> float:
         x1, y1, x2, y2 = bbox
         hpx = max(1, y2 - y1)
         known_vehicle_height = 1.5
@@ -289,8 +276,7 @@ class VehicleSpeedEstimator:
             vps = self.vp_detector.detect_vanishing_points(deepvan_frame)
             self.calibrate_camera(vps, frame.shape)
             logger.info(f"Recalibrated camera at frame {self.frame_count}")
-        depth_map = self.depth_estimator.estimate_depth(midas_frame)
-        depth_map = cv2.resize(depth_map, (frame.shape[1], frame.shape[0]))
+        # Depth map not used for scale in current implementation
         results = self.vehicle_detector.predict(frame, conf=0.25, classes=[2, 3, 5, 7])
         detections: List[Tuple[Tuple[int, int, int, int], float, int]] = []
         for r in (results if isinstance(results, list) else [results]):
@@ -307,10 +293,10 @@ class VehicleSpeedEstimator:
         flow = None
         if self.prev_frame is not None:
             flow = self.flow_estimator.compute_flow(self.prev_frame, frame)
-        dt = 1.0 / 30.0
+        dt = self.dt
         for tr in tracks:
             if flow is not None and self.camera_params.homography is not None:
-                scale = self.compute_scale_factor(depth_map, tr.bbox)
+                scale = self.compute_scale_factor(tr.bbox)
                 disp = self.estimate_vehicle_displacement(flow, tr.bbox, self.camera_params.homography, scale)
                 speed_kmh = float(np.linalg.norm(disp) / dt * 3.6)
                 if tr.kalman_filter is not None:
@@ -351,7 +337,9 @@ class VehicleSpeedEstimator:
         if not cap.isOpened():
             logger.error("Failed to open video source")
             return
-        fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+        fps_read = cap.get(cv2.CAP_PROP_FPS)
+        fps = int(fps_read) if fps_read and fps_read > 1e-3 else 30
+        self.dt = 1.0 / float(max(fps, 1))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         out = cv2.VideoWriter(self.output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
