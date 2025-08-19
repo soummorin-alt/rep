@@ -242,15 +242,56 @@ class VehicleSpeedEstimator:
         logger.info("VehicleSpeedEstimator initialized")
 
     def calibrate_camera(self, vanishing_points: np.ndarray, frame_shape: Tuple[int, int, int]):
+        """Estimate intrinsics and ground-plane homography from vanishing points.
+
+        - Build K with principal point at center and focal ~ sqrt(w*h)
+        - Convert image VPs to camera directions via K^{-1}
+        - Orthonormalize to form rotation R
+        - Construct H = K (R - t n^T / h) K^{-1} with n=(0,1,0), t=(0,h,0)
+        """
         h, w = frame_shape[:2]
         cx, cy = w / 2.0, h / 2.0
-        f = np.sqrt(w * h)
+        f = float(np.sqrt(w * h))
         K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float32)
-        R = np.eye(3, dtype=np.float32)
-        t = np.array([0.0, 0.0, self.camera_params.height], dtype=np.float32)
+        K_inv = np.linalg.inv(K)
+
+        # Build normalized direction vectors from VPs
+        dirs: List[np.ndarray] = []
+        for i in range(min(3, len(vanishing_points))):
+            u, v = float(vanishing_points[i, 0]), float(vanishing_points[i, 1])
+            vp_cam = K_inv @ np.array([u, v, 1.0], dtype=np.float32)
+            norm = float(np.linalg.norm(vp_cam))
+            if norm < 1e-8:
+                continue
+            dirs.append(vp_cam / norm)
+
+        # Fallback if insufficient distinct directions
+        if len(dirs) < 2:
+            R = np.eye(3, dtype=np.float32)
+        else:
+            d1 = dirs[0]
+            d2 = dirs[1] - np.dot(dirs[1], d1) * d1
+            d2_norm = float(np.linalg.norm(d2))
+            if d2_norm < 1e-8:
+                # If nearly collinear, fallback to identity
+                R = np.eye(3, dtype=np.float32)
+            else:
+                d2 = d2 / d2_norm
+                d3 = np.cross(d1, d2)
+                # Ensure right-handed system
+                d3_norm = float(np.linalg.norm(d3))
+                if d3_norm < 1e-8:
+                    R = np.eye(3, dtype=np.float32)
+                else:
+                    d3 = d3 / d3_norm
+                    R = np.column_stack([d1, d2, d3]).astype(np.float32)
+
+        # Ground plane homography
+        cam_h = float(self.camera_params.height)
         n = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-        d = float(self.camera_params.height)
-        H = K @ (R - np.outer(t, n) / max(d, 1e-6)) @ np.linalg.inv(K)
+        t = np.array([0.0, cam_h, 0.0], dtype=np.float32)
+        H = K @ (R - np.outer(t, n) / max(cam_h, 1e-6)) @ K_inv
+
         self.camera_params.fx = f
         self.camera_params.fy = f
         self.camera_params.cx = cx
@@ -323,7 +364,14 @@ class VehicleSpeedEstimator:
         deepvan_frame = cv2.resize(frame, (512, 512))
         if self.frame_count % self.recalibration_interval == 0:
             vps = self.vp_detector.detect_vanishing_points(deepvan_frame)
-            self.calibrate_camera(vps, frame.shape)
+            # Scale VPs from DeepVan input size to current frame size
+            vh, vw = deepvan_frame.shape[:2]
+            scale_x = frame.shape[1] / float(max(vw, 1))
+            scale_y = frame.shape[0] / float(max(vh, 1))
+            vps_scaled = vps.copy()
+            vps_scaled[:, 0] *= scale_x
+            vps_scaled[:, 1] *= scale_y
+            self.calibrate_camera(vps_scaled, frame.shape)
             logger.info(f"Recalibrated camera at frame {self.frame_count}")
         # Estimate relative depth (used to refine scale)
         depth_map = self.depth_estimator.estimate_depth(midas_frame)
