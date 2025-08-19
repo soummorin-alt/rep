@@ -56,14 +56,40 @@ class KalmanFilter1D:
 
 
 class MiDaSDepthEstimator:
-    """Optional depth estimator placeholder (not used for scale in this pipeline)."""
+    """MiDaS depth estimator with graceful fallback if unavailable."""
     def __init__(self, model_type: str = "DPT_Hybrid"):
         self.model = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info("MiDaS depth is not used for scale in this pipeline; skipping load.")
+        try:
+            import torch.hub
+            self.model = torch.hub.load("intel/MiDaS", model_type)
+            self.model.to(self.device).eval()
+            midas_transforms = torch.hub.load("intel/MiDaS", "transforms")
+            self.transform = midas_transforms.dpt_transform if model_type == "DPT_Hybrid" else midas_transforms.default_transform
+            logger.info(f"Loaded MiDaS {model_type} on {self.device}")
+        except Exception as e:
+            logger.warning(f"MiDaS not available, depth-based scaling will be approximate: {e}")
+            self.model = None
+            self.transform = None
+
     def estimate_depth(self, frame: np.ndarray) -> np.ndarray:
-        h, w = frame.shape[:2]
-        return np.zeros((h, w), dtype=np.float32)
+        if self.model is None or self.transform is None:
+            # Return a uniform map to indicate unavailable depth
+            return np.zeros((frame.shape[0], frame.shape[1]), dtype=np.float32)
+        input_batch = self.transform(frame).to(self.device)
+        with torch.no_grad():
+            prediction = self.model(input_batch)
+            prediction = torch.nn.functional.interpolate(
+                prediction.unsqueeze(1), size=frame.shape[:2], mode="bicubic", align_corners=False
+            ).squeeze()
+        depth_map = prediction.cpu().numpy().astype(np.float32)
+        # Normalize to [0,1] for relative comparison
+        dmin, dmax = float(depth_map.min()), float(depth_map.max())
+        if dmax - dmin > 1e-6:
+            depth_map = (depth_map - dmin) / (dmax - dmin)
+        else:
+            depth_map = np.zeros_like(depth_map, dtype=np.float32)
+        return depth_map
 
 
 class RAFTOpticalFlow:
@@ -198,7 +224,7 @@ class ByteTracker:
 
 class VehicleSpeedEstimator:
     def __init__(self, video_path: Optional[str] = None, camera_id: int = 0, output_path: str = "output_speed_estimation.mp4"):
-        # Depth estimator currently not used for scale; keep placeholder
+        # Depth estimator optionally used to refine scale
         self.depth_estimator = MiDaSDepthEstimator()
         self.flow_estimator = RAFTOpticalFlow()
         self.vp_detector = DeepVanishingPoint()
@@ -233,11 +259,34 @@ class VehicleSpeedEstimator:
         self.camera_params.homography = H
         return K, H
 
-    def compute_scale_factor(self, bbox: Tuple[int, int, int, int]) -> float:
+    def compute_scale_factor(self, depth_map: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
+        """Compute meters-per-pixel at the ground using box height and refine with local depth.
+
+        Baseline: known_vehicle_height / pixel_height.
+        Refinement: adjust by ratio of global median depth to local bottom-center depth (clamped).
+        """
         x1, y1, x2, y2 = bbox
         hpx = max(1, y2 - y1)
         known_vehicle_height = 1.5
-        return known_vehicle_height / float(hpx)
+        base_scale = known_vehicle_height / float(hpx)
+        if depth_map is None or depth_map.size == 0:
+            return base_scale
+        H, W = depth_map.shape[:2]
+        bx = int(np.clip((x1 + x2) / 2.0, 0, W - 1))
+        by = int(np.clip(y2, 0, H - 1))
+        # Sample a small patch near the bottom-center of bbox
+        patch_half = 2
+        x0, x1p = max(0, bx - patch_half), min(W, bx + patch_half + 1)
+        y0, y1p = max(0, by - patch_half), min(H, by + patch_half + 1)
+        patch = depth_map[y0:y1p, x0:x1p]
+        local_depth = float(np.median(patch)) if patch.size > 0 else 0.0
+        global_depth = float(np.median(depth_map)) if depth_map.size > 0 else 0.0
+        if local_depth <= 0 or global_depth <= 0:
+            return base_scale
+        # If MiDaS is inverse/relative, using ratio provides a gentle adjustment
+        depth_ratio = np.clip(global_depth / max(local_depth, 1e-6), 0.5, 1.5)
+        refined_scale = base_scale * float(depth_ratio)
+        return refined_scale
 
     def estimate_vehicle_displacement(self, flow: np.ndarray, bbox: Tuple[int, int, int, int], homography: np.ndarray, scale_factor: float) -> float:
         x1, y1, x2, y2 = bbox
@@ -276,7 +325,9 @@ class VehicleSpeedEstimator:
             vps = self.vp_detector.detect_vanishing_points(deepvan_frame)
             self.calibrate_camera(vps, frame.shape)
             logger.info(f"Recalibrated camera at frame {self.frame_count}")
-        # Depth map not used for scale in current implementation
+        # Estimate relative depth (used to refine scale)
+        depth_map = self.depth_estimator.estimate_depth(midas_frame)
+        depth_map = cv2.resize(depth_map, (frame.shape[1], frame.shape[0]))
         results = self.vehicle_detector.predict(frame, conf=0.25, classes=[2, 3, 5, 7])
         detections: List[Tuple[Tuple[int, int, int, int], float, int]] = []
         for r in (results if isinstance(results, list) else [results]):
@@ -296,7 +347,7 @@ class VehicleSpeedEstimator:
         dt = self.dt
         for tr in tracks:
             if flow is not None and self.camera_params.homography is not None:
-                scale = self.compute_scale_factor(tr.bbox)
+                scale = self.compute_scale_factor(depth_map, tr.bbox)
                 disp = self.estimate_vehicle_displacement(flow, tr.bbox, self.camera_params.homography, scale)
                 speed_kmh = float(np.linalg.norm(disp) / dt * 3.6)
                 if tr.kalman_filter is not None:
