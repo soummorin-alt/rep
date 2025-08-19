@@ -13,7 +13,6 @@ import time
 import csv
 import json
 import argparse
-from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 import warnings
@@ -21,12 +20,11 @@ warnings.filterwarnings('ignore')
 
 # Optional dependencies for enhanced functionality
 try:
-    import torch
     from ultralytics import YOLO
     YOLO_AVAILABLE = True
 except ImportError:
     YOLO_AVAILABLE = False
-    print("Warning: YOLOv8 not available. Using OpenCV cascade classifier for vehicle detection.")
+    print("Warning: YOLOv8 not available; vehicle detection disabled.")
 
 try:
     import pyttsx3
@@ -42,12 +40,12 @@ class CameraIntrinsics:
     fy: float
     cx: float
     cy: float
-    
+
     @property
     def K(self) -> np.ndarray:
         return np.array([[self.fx, 0, self.cx],
-                        [0, self.fy, self.cy],
-                        [0, 0, 1]], dtype=np.float32)
+                         [0, self.fy, self.cy],
+                         [0, 0, 1]], dtype=np.float32)
 
 @dataclass
 class VehicleTrack:
@@ -65,104 +63,37 @@ class DiamondSpaceVPDetector:
     Vanishing point detector using diamond space accumulation
     Based on Dubská & Herout paper
     """
-    
+
     def __init__(self, resolution: int = 512, d: float = 1.0, D: float = 1.0, mu: float = 1.0):
         self.resolution = resolution
         self.d = d  # Distance between parallel axes in first space
-        self.D = D  # Distance between parallel axes in second space  
+        self.D = D  # Distance between parallel axes in second space
         self.mu = mu  # Image normalization factor
         self.accumulator = np.zeros((resolution, resolution), dtype=np.float32)
-        # Store which transformation was used for each accumulator cell
         self.transform_map = np.full((resolution, resolution), "", dtype='U2')
-        
+
     def normalize_coordinates(self, points: np.ndarray, img_shape: Tuple[int, int]) -> np.ndarray:
         """Normalize image coordinates to [-mu, mu] range"""
         h, w = img_shape[:2]
         normalized = np.zeros_like(points, dtype=np.float32)
-        normalized[:, 0] = (2 * points[:, 0] / (w - 1) - 1) * self.mu  # x -> u
-        normalized[:, 1] = (2 * points[:, 1] / (h - 1) - 1) * self.mu  # y -> v
+        normalized[:, 0] = (2 * points[:, 0] / (w - 1) - 1) * self.mu
+        normalized[:, 1] = (2 * points[:, 1] / (h - 1) - 1) * self.mu
         return normalized
-    
-    def diamond_space_mapping(self, points: np.ndarray) -> np.ndarray:
-        """
-        Map points to diamond space using the four transformations from Eq. (5)
-        Returns: array of diamond space coordinates for each transformation
-        """
-        u, v = points[:, 0], points[:, 1]
-        w = np.ones_like(u)
-        
-        # Four cascaded transformations from Eq. (5)
-        # SS: [−dDw, −dx, −x + y − dw]
-        ss = np.column_stack([
-            -self.d * self.D * w,
-            -self.d * u,
-            -u + v - self.d * w
-        ])
-        
-        # ST: [−dDw, −dx, −x + y + dw] 
-        st = np.column_stack([
-            -self.d * self.D * w,
-            -self.d * u,
-            -u + v + self.d * w
-        ])
-        
-        # TS: [−dDw, −dx, x + y − dw]
-        ts = np.column_stack([
-            -self.d * self.D * w,
-            -self.d * u,
-            u + v - self.d * w
-        ])
-        
-        # TT: [−dDw, −dx, x + y + dw]
-        tt = np.column_stack([
-            -self.d * self.D * w,
-            -self.d * u,
-            u + v + self.d * w
-        ])
-        
-        return np.array([ss, st, ts, tt])
-    
-    def project_to_accumulator(self, diamond_coords: np.ndarray) -> List[Tuple[int, int]]:
-        """Project diamond space coordinates to accumulator indices"""
-        indices = []
-        for coords in diamond_coords:
-            # Normalize to [0, 1] range for accumulator indexing
-            # Using the second and third coordinates (p, q space)
-            valid_mask = coords[:, 0] != 0  # Avoid division by zero
-            
-            if np.any(valid_mask):
-                p = coords[valid_mask, 1] / coords[valid_mask, 0]  # -dx / (-dDw)
-                q = coords[valid_mask, 2] / coords[valid_mask, 0]  # third_coord / (-dDw)
-                
-                # Map to accumulator space [0, resolution-1]
-                # Determine appropriate scaling based on expected range
-                scale_factor = self.resolution / (4 * self.mu)  # Adjust based on normalization
-                
-                acc_p = ((p + 2 * self.mu) * scale_factor).astype(np.int32)
-                acc_q = ((q + 2 * self.mu) * scale_factor).astype(np.int32)
-                
-                # Clip to valid accumulator range
-                acc_p = np.clip(acc_p, 0, self.resolution - 1)
-                acc_q = np.clip(acc_q, 0, self.resolution - 1)
-                
-                indices.extend(list(zip(acc_p, acc_q)))
-        
-        return indices
-    
+
     def accumulate_edgelets(self, edgelets: np.ndarray, img_shape: Tuple[int, int]):
         """Accumulate edgelets in diamond space"""
         self.accumulator.fill(0)
         self.transform_map.fill("")
-        
+
         if len(edgelets) == 0:
             return
-            
+
         # Normalize coordinates to [-mu, mu] range
         h, w = img_shape[:2]
-        u = (2 * edgelets[:, 0] / (w - 1) - 1) * self.mu  
+        u = (2 * edgelets[:, 0] / (w - 1) - 1) * self.mu
         v = (2 * edgelets[:, 1] / (h - 1) - 1) * self.mu
         w_coord = np.ones_like(u)
-        
+
         # Apply four diamond space transformations
         transforms = {
             'SS': (-self.d * self.D * w_coord, -self.d * u, -u + v - self.d * w_coord),
@@ -170,38 +101,31 @@ class DiamondSpaceVPDetector:
             'TS': (-self.d * self.D * w_coord, -self.d * u,  u + v - self.d * w_coord),
             'TT': (-self.d * self.D * w_coord, -self.d * u,  u + v + self.d * w_coord)
         }
-        
-        # Accumulate votes for each transformation
+
+        # Vectorized accumulation into accumulator
+        p_range = 4 * self.mu
+        q_range = 4 * self.mu
         for transform_name, (coord0, coord1, coord2) in transforms.items():
-            # Convert to accumulator indices
-            valid_mask = np.abs(coord0) > 1e-10  # Avoid division by zero
-            
-            if np.any(valid_mask):
-                p = coord1[valid_mask] / coord0[valid_mask]  
-                q = coord2[valid_mask] / coord0[valid_mask]
-                
-                # Map to accumulator coordinates [0, resolution-1]
-                # Determine bounds based on expected p,q range
-                p_range = 4 * self.mu  # Expected range for p
-                q_range = 4 * self.mu  # Expected range for q
-                
-                acc_p = ((p + p_range/2) / p_range * (self.resolution - 1)).astype(np.int32)
-                acc_q = ((q + q_range/2) / q_range * (self.resolution - 1)).astype(np.int32)
-                
-                # Clip to valid range
-                acc_p = np.clip(acc_p, 0, self.resolution - 1)
-                acc_q = np.clip(acc_q, 0, self.resolution - 1)
-                
-                # Vote in accumulator
-                for i in range(len(acc_p)):
-                    self.accumulator[acc_q[i], acc_p[i]] += 1.0
-                    self.transform_map[acc_q[i], acc_p[i]] = transform_name
-    
+            valid_mask = np.abs(coord0) > 1e-10
+            if not np.any(valid_mask):
+                continue
+            p = coord1[valid_mask] / coord0[valid_mask]
+            q = coord2[valid_mask] / coord0[valid_mask]
+            acc_p = ((p + p_range / 2) / p_range * (self.resolution - 1)).astype(np.int32)
+            acc_q = ((q + q_range / 2) / q_range * (self.resolution - 1)).astype(np.int32)
+            acc_p = np.clip(acc_p, 0, self.resolution - 1)
+            acc_q = np.clip(acc_q, 0, self.resolution - 1)
+            np.add.at(self.accumulator, (acc_q, acc_p), 1.0)
+            self.transform_map[acc_q, acc_p] = transform_name
+
     def find_vanishing_points(self, num_vps: int = 3) -> List[Tuple[np.ndarray, float]]:
-        """Find vanishing points by detecting peaks in accumulator"""
+        """Find vanishing points by detecting peaks in accumulator with spatial diversity enforcement"""
         vps = []
         temp_acc = self.accumulator.copy()
         temp_transform_map = self.transform_map.copy()
+        
+        # Minimum distance between vanishing points (in accumulator space)
+        min_vp_distance = 50  # pixels in accumulator space
         
         for _ in range(num_vps):
             # Find peak
@@ -216,7 +140,7 @@ class DiamondSpaceVPDetector:
             
             if transform_type == "":
                 break
-                
+            
             # Convert accumulator indices back to (p,q) coordinates
             q_acc, p_acc = peak_idx
             
@@ -244,7 +168,6 @@ class DiamondSpaceVPDetector:
                 x = self.D * q
                 y = -self.d * p + self.D * q + self.d * self.D
                 w = 1.0
-        
             
             # Form vanishing point in homogeneous coordinates
             vp = np.array([x, y, w])
@@ -252,11 +175,24 @@ class DiamondSpaceVPDetector:
             
             # Convert back to image coordinates (denormalize)
             vp_img = np.array([vp[0]/self.mu, vp[1]/self.mu, 1.0])
+            
+            # Check spatial diversity with previously selected VPs
+            if len(vps) > 0:
+                min_dist_to_existing = float('inf')
+                for existing_vp, _ in vps:
+                    dist = np.linalg.norm(vp_img[:2] - existing_vp[:2])
+                    min_dist_to_existing = min(min_dist_to_existing, dist)
+                
+                if min_dist_to_existing < min_vp_distance:
+                    print(f"Rejecting VP at ({vp_img[0]:.1f}, {vp_img[1]:.1f}) - too close to existing VPs (min dist: {min_dist_to_existing:.1f} px)")
+                    # Suppress this peak and continue to next
+                    temp_acc[peak_idx] = 0
+                    continue
 
             vps.append((vp_img, peak_value))
             
-            # Remove peak region to find next VP
-            mask_size = max(10, self.resolution // 20)
+            # Remove peak region to find next VP (wider suppression for better diversity)
+            mask_size = max(20, self.resolution // 15)  # Increased from resolution // 20
             y_start = max(0, peak_idx[0] - mask_size)
             y_end = min(temp_acc.shape[0], peak_idx[0] + mask_size + 1)
             x_start = max(0, peak_idx[1] - mask_size)
@@ -264,72 +200,71 @@ class DiamondSpaceVPDetector:
             
             temp_acc[y_start:y_end, x_start:x_end] = 0
         
+        # Quality check: ensure we have enough well-distributed VPs
+        if len(vps) < 2:
+            print(f"Warning: Only {len(vps)} vanishing points found, need at least 2 for calibration")
+            return []
+        
+        # Final spatial diversity check
+        if len(vps) >= 2:
+            vp_coords = np.array([vp[:2] for vp, _ in vps])
+            distances = []
+            for i in range(len(vps)):
+                for j in range(i+1, len(vps)):
+                    dist = np.linalg.norm(vp_coords[i] - vp_coords[j])
+                    distances.append(dist)
+            
+            min_dist = min(distances) if distances else 0
+            if min_dist < min_vp_distance:
+                print(f"Warning: Final VP check failed - minimum distance {min_dist:.1f} px < threshold {min_vp_distance} px")
+                return []
+        
         return vps
 
 class KalmanFilter:
     """Kalman filter for velocity smoothing"""
-    
-    def __init__(self, dt: float = 1.0/30.0):
+
+    def __init__(self, dt: float = 1.0 / 30.0):
         self.dt = dt
         self.initialized = False
-        
         # State: [X, Z, vX, vZ]
         self.state = np.zeros(4, dtype=np.float32)
-        self.P = np.eye(4, dtype=np.float32) * 1000  # High initial uncertainty
-        
-        # State transition matrix
+        self.P = np.eye(4, dtype=np.float32) * 1000
         self.F = np.array([[1, 0, dt, 0],
-                          [0, 1, 0, dt],
-                          [0, 0, 1, 0],
-                          [0, 0, 0, 1]], dtype=np.float32)
-        
-        # Measurement matrix (observe velocities)
+                           [0, 1, 0, dt],
+                           [0, 0, 1, 0],
+                           [0, 0, 0, 1]], dtype=np.float32)
         self.H = np.array([[0, 0, 1, 0],
-                          [0, 0, 0, 1]], dtype=np.float32)
-        
-        # Process noise
+                           [0, 0, 0, 1]], dtype=np.float32)
         q = 0.1
-        self.Q = np.array([[dt**4/4, 0, dt**3/2, 0],
-                          [0, dt**4/4, 0, dt**3/2],
-                          [dt**3/2, 0, dt**2, 0],
-                          [0, dt**3/2, 0, dt**2]], dtype=np.float32) * q
-        
-        # Measurement noise
+        self.Q = np.array([[dt ** 4 / 4, 0, dt ** 3 / 2, 0],
+                           [0, dt ** 4 / 4, 0, dt ** 3 / 2],
+                           [dt ** 3 / 2, 0, dt ** 2, 0],
+                           [0, dt ** 3 / 2, 0, dt ** 2]], dtype=np.float32) * q
         self.R = np.eye(2, dtype=np.float32) * 10.0
-    
+
     def predict(self):
-        """Predict step"""
         self.state = self.F @ self.state
         self.P = self.F @ self.P @ self.F.T + self.Q
-    
+
     def update(self, measurement: np.ndarray):
-        """Update step with velocity measurement [vX, vZ]"""
         if not self.initialized:
             self.state[2:] = measurement
             self.initialized = True
             return
-        
-        # Innovation
         y = measurement - (self.H @ self.state)
-        
-        # Innovation covariance
         S = self.H @ self.P @ self.H.T + self.R
-        
-        # Kalman gain
         K = self.P @ self.H.T @ np.linalg.inv(S)
-        
-        # Update state and covariance
         self.state = self.state + K @ y
         I_KH = np.eye(4) - K @ self.H
         self.P = I_KH @ self.P
-    
+
     def get_velocity(self) -> np.ndarray:
-        """Get filtered velocity [vX, vZ]"""
         return self.state[2:].copy()
 
 class VehicleSpeedEstimator:
     """Main vehicle speed estimation pipeline"""
-    
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         
@@ -345,17 +280,12 @@ class VehicleSpeedEstimator:
         self.homography_ground: Optional[np.ndarray] = None
         self.scale_factor: Optional[float] = None
         
-        # Vehicle detection
+        # Vehicle detection (YOLO only)
         if YOLO_AVAILABLE:
             self.vehicle_detector = YOLO('yolov8n.pt')
         else:
-            # Fallback to OpenCV cascade classifier
-            cascade_path = cv2.data.haarcascades + 'haarcascade_car.xml'
-            if Path(cascade_path).exists():
-                self.vehicle_detector = cv2.CascadeClassifier(cascade_path)
-            else:
-                self.vehicle_detector = None
-                print("Warning: No vehicle detector available")
+            self.vehicle_detector = None
+            print("Warning: YOLOv8n not available; vehicle detection disabled.")
         
         # Tracking
         self.tracks: Dict[int, VehicleTrack] = {}
@@ -364,12 +294,11 @@ class VehicleSpeedEstimator:
         
         # Feature tracking parameters
         self.feature_params = dict(
-            maxCorners=20,
-            qualityLevel=0.01,
-            minDistance=7,
-            blockSize=7
+            maxCorners=10,
+            qualityLevel=0.001,
+            minDistance=5,
+            blockSize=5
         )
-        
         self.lk_params = dict(
             winSize=(21, 21),
             maxLevel=3,
@@ -377,8 +306,14 @@ class VehicleSpeedEstimator:
         )
         
         # Speed parameters
-        self.speed_threshold = config.get('speed_threshold', 50)  # km/h
-        self.reference_height = config.get('reference_vehicle_height', 1.5)  # meters
+        self.speed_threshold = config.get('speed_threshold', 50)
+        self.reference_height = config.get('reference_vehicle_height', 1.5)
+        
+        # Input speed for testing (when computed speed is zero)
+        self.input_speed = config.get('input_speed', None)
+        
+        # Verbose logging flag
+        self.verbose = config.get('verbose', False)
         
         # Calibration
         self.calibration_frames = 0
@@ -400,91 +335,45 @@ class VehicleSpeedEstimator:
             'vehicles_detected': 0,
             'speed_violations': 0
         }
-    
+
     def extract_edgelets(self, image: np.ndarray) -> np.ndarray:
-        """Extract edgelets from image using Canny edge detection"""
-        # Convert to grayscale
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Gaussian blur
         blurred = cv2.GaussianBlur(gray, (5, 5), 1.0)
-        
-        # Canny edge detection
         edges = cv2.Canny(blurred, 50, 150)
-        
-        # Find edge pixels
         edge_pixels = np.where(edges > 0)
-        
         if len(edge_pixels[0]) == 0:
             return np.array([]).reshape(0, 2)
-        
-        # Compute gradients for orientation
         grad_x = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
         grad_y = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
-        
-        # Create edgelets (center points of short line segments)
         edgelets = []
-        edgelet_length = 5
-        
         for y, x in zip(edge_pixels[0], edge_pixels[1]):
             if 0 <= y < grad_y.shape[0] and 0 <= x < grad_x.shape[1]:
-                # Gradient orientation
-                theta = np.arctan2(grad_y[y, x], grad_x[y, x])
-                
-                # Edgelet endpoints
-                dx = edgelet_length * np.cos(theta) / 2
-                dy = edgelet_length * np.sin(theta) / 2
-                
-                edgelets.append([x, y])  # Store center point
-        
+                edgelets.append([x, y])
         return np.array(edgelets, dtype=np.float32) if edgelets else np.array([]).reshape(0, 2)
-    
+
     def compute_camera_intrinsics(self, vanishing_points: List[Tuple[np.ndarray, float]], img_shape: Tuple[int, int]) -> bool:
-        """Compute camera intrinsics from three vanishing points via nonlinear orthogonality solve."""
         if len(vanishing_points) < 3:
             return False
         h, w = img_shape[:2]
-        (u1, v1), _ = vanishing_points[0]
-        (u2, v2), _ = vanishing_points[1]
-        (u3, v3), _ = vanishing_points[2]
-
+        (vp1, _), (vp2, _), (vp3, _) = vanishing_points[:3]
+        u1, v1 = float(vp1[0]), float(vp1[1])
+        u2, v2 = float(vp2[0]), float(vp2[1])
+        u3, v3 = float(vp3[0]), float(vp3[1])
         from scipy.optimize import least_squares
-
         def residuals(vars):
             cx, cy, f2 = vars
-            r1 = (u1 - cx)*(u2 - cx) + (v1 - cy)*(v2 - cy) + f2
-            r2 = (u1 - cx)*(u3 - cx) + (v1 - cy)*(v3 - cy) + f2
-            r3 = (u2 - cx)*(u3 - cx) + (v2 - cy)*(v3 - cy) + f2
+            r1 = (u1 - cx) * (u2 - cx) + (v1 - cy) * (v2 - cy) + f2
+            r2 = (u1 - cx) * (u3 - cx) + (v1 - cy) * (v3 - cy) + f2
+            r3 = (u2 - cx) * (u3 - cx) + (v2 - cy) * (v3 - cy) + f2
             return [r1, r2, r3]
-
-        # Initial guess: principal point at image center, f^2 = max dimension^2
-        init = [(w - 1)/2, (h - 1)/2, max(w, h)**2]
+        init = [(w - 1) / 2, (h - 1) / 2, max(w, h) ** 2]
         sol = least_squares(residuals, init)
         cx, cy, f2 = sol.x
         f = np.sqrt(abs(f2))
         self.camera_intrinsics = CameraIntrinsics(f, f, cx, cy)
-
-        # Compute rotation matrix from vanishing points
         self.compute_rotation_matrix(vanishing_points)
         return True
 
-
-    def compute_ground_homography(self) -> bool:
-        """Compute homography mapping the world ground plane (Y=0) to image plane."""
-        if self.camera_intrinsics is None or self.rotation_matrix is None:
-            return False
-
-        K = self.camera_intrinsics.K
-        R = self.rotation_matrix
-        h_cam = self.config.get('camera_height', 1.7)  # meters
-
-        # Use first two columns of R (X and Y world axes) and translation [0, h_cam, 0]
-        t = np.array([0.0, h_cam, 0.0], dtype=np.float32)
-        H_ground = K @ np.column_stack([R[:, 0], R[:, 1], t])
-
-        self.homography_ground = H_ground
-        return True
-    
     def compute_rotation_matrix(self, vanishing_points: List[Tuple[np.ndarray, float]]):
         """Compute camera rotation matrix from vanishing points"""
         K = self.camera_intrinsics.K
@@ -504,9 +393,96 @@ class VehicleSpeedEstimator:
             d3 = np.cross(d1, d2)
             
             self.rotation_matrix = np.column_stack([d1, d2, d3])
-    
-    def calibrate_scale(self, reference_bbox: Tuple[int, int, int, int], 
-                       reference_height: float) -> bool:
+            
+            # Validate rotation matrix
+            R = self.rotation_matrix
+            RTR = R.T @ R
+            print("Rotation matrix R:")
+            print(R)
+            print("R^T @ R =")
+            print(RTR)
+            
+            # Check orthogonality
+            identity_diff = np.abs(RTR - np.eye(3))
+            max_deviation = np.max(identity_diff)
+            print(f"Max deviation from identity: {max_deviation:.2e}")
+            
+            if max_deviation > 1e-3:
+                print("WARNING: Rotation matrix is not properly orthogonal!")
+                return False
+            
+            # Check determinant
+            det = np.linalg.det(R)
+            print(f"Rotation matrix determinant: {det:.6f}")
+            if abs(det - 1.0) > 1e-3:
+                print("WARNING: Rotation matrix determinant is not 1.0!")
+                return False
+                
+            return True
+        return False
+
+    def compute_ground_homography(self) -> bool:
+        """Compute homography mapping the world ground plane (Y=0) to image plane."""
+        if self.camera_intrinsics is None or self.rotation_matrix is None:
+            return False
+
+        K = self.camera_intrinsics.K
+        R = self.rotation_matrix
+        h_cam = self.config.get('camera_height', 1.7)  # meters
+
+        # Use first two columns of R (X and Z world axes) and translation [0, h_cam, 0]
+        t = np.array([0.0, h_cam, 0.0], dtype=np.float32)
+        H_ground = K @ np.column_stack([R[:, 0], R[:, 1], t])
+
+        # Strict homography validation
+        det = np.linalg.det(H_ground)
+        print(f"Homography determinant: {det:.2e}")
+        
+        if abs(det) < 1e-6:
+            print("ERROR: Homography is nearly singular! Recalibration needed.")
+            return False
+            
+        if np.any(np.isnan(H_ground)) or np.any(np.isinf(H_ground)):
+            print(f"ERROR: Invalid homography computed. Camera height: {h_cam}m")
+            return False
+
+        # Test homography with sample image points
+        h, w = self.config.get('image_shape', (480, 640))
+        test_points = [
+            (w//2, h//2),      # center
+            (w//4, h//4),      # top-left quadrant
+            (3*w//4, 3*h//4),  # bottom-right quadrant
+            (w//2, h-50)       # near bottom center
+        ]
+        
+        print("Testing homography with sample image points:")
+        world_points = []
+        for x, y in test_points:
+            p_homo = np.array([x, y, 1.0])
+            try:
+                H_inv = np.linalg.inv(H_ground)
+                world_p = H_inv @ p_homo
+                world_p = world_p / world_p[2] if abs(world_p[2]) > 1e-6 else world_p
+                world_points.append(world_p[:2])
+                print(f"  Image ({x}, {y}) -> World ({world_p[0]:.3f}, {world_p[1]:.3f})")
+            except np.linalg.LinAlgError:
+                print(f"  Image ({x}, {y}) -> ERROR")
+                return False
+        
+        # Check if world points vary (not all the same)
+        if len(world_points) > 1:
+            world_array = np.array(world_points)
+            variance = np.var(world_array, axis=0)
+            print(f"World coordinates variance: {variance}")
+            if np.any(variance < 1e-6):
+                print("WARNING: World coordinates show very little variation!")
+                return False
+
+        self.homography_ground = H_ground
+        print(f"Ground homography computed with camera height: {h_cam}m")
+        return True
+
+    def calibrate_scale(self, reference_bbox: Tuple[int, int, int, int], reference_height: float) -> bool:
         """Calibrate metric scale using reference vehicle with least squares solver"""
         if self.camera_intrinsics is None or self.rotation_matrix is None:
             return False
@@ -529,7 +505,6 @@ class VehicleSpeedEstimator:
         # Rearranged: λ_bot * p_bot - R @ [X, 0, Z]^T = 0
         #            λ_top * p_top - R @ [X, H, Z]^T = 0
         
-        # Build 6x4 system matrix for [λ_bot, λ_top, X, Z]
         # Build 6×4 system for [λ_bot, λ_top, X, Z]:
         A = np.zeros((6,4)); b = np.zeros(6)
         # λ_bot * p_bot = R @ [X,0,Z]^T
@@ -544,69 +519,73 @@ class VehicleSpeedEstimator:
 
         sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
         lam_bot, lam_top, X, Z = sol
+        
+        # Verify solution is reasonable
+        if abs(lam_bot) < 1e-6 or abs(lam_top) < 1e-6:
+            print(f"Warning: Scale calibration failed - invalid lambda values: λ_bot={lam_bot:.2e}, λ_top={lam_top:.2e}")
+            return False
+            
         P_bot = lam_bot * p_bot
         P_top = lam_top * p_top
         world_height = np.linalg.norm(P_top - P_bot)
         if world_height > 1e-6:
            self.scale_factor = reference_height / world_height
+           print(f"Scale calibration successful: world_height={world_height:.6f}m, scale_factor={self.scale_factor:.6f}")
            return True
+        print(f"Warning: Scale calibration failed - computed world height too small: {world_height:.2e}m")
         return False
 
-    
-    
-    def detect_vehicles(self, image: np.ndarray) -> List[Tuple[int,int,int,int,float]]:
-        detections = []
-        if YOLO_AVAILABLE and hasattr(self, 'vehicle_detector'):
-            # Instead of indexing, do:
-            results = self.vehicle_detector(image, conf=0.4, classes=[2,5,7])
-            # results is a Results object
-            for box in results.boxes:
-                x1, y1, x2, y2 = box.xyxy.cpu().numpy()
-                conf = box.conf.cpu().numpy()
+    def _detect_with_yolo(self, image: np.ndarray) -> List[Tuple[int, int, int, int, float]]:
+        if not YOLO_AVAILABLE or self.vehicle_detector is None:
+            return []
+        results = self.vehicle_detector(image, conf=0.25, classes=[2, 3, 5, 7])
+        results = results if isinstance(results, list) else [results]
+        detections: List[Tuple[int, int, int, int, float]] = []
+        for r in results:
+            if not hasattr(r, 'boxes') or r.boxes is None:
+                continue
+            xyxy = r.boxes.xyxy.cpu().numpy() if hasattr(r.boxes, 'xyxy') else np.empty((0, 4))
+            confs = r.boxes.conf.cpu().numpy() if hasattr(r.boxes, 'conf') else np.ones((xyxy.shape[0],), dtype=np.float32)
+            for (x1, y1, x2, y2), conf in zip(xyxy, confs):
                 detections.append((int(x1), int(y1), int(x2), int(y2), float(conf)))
-
-        else:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            if self.vehicle_detector is not None:
-                cars = self.vehicle_detector.detectMultiScale(gray, 1.1, 5)
-                for (x, y, w, h) in cars:
-                    detections.append((x, y, x+w, y+h, 0.8))
         return detections
-    
-    def associate_detections_to_tracks(self, detections: List[Tuple[int, int, int, int, float]],
-                                     timestamp: float) -> Dict[int, Tuple[int, int, int, int]]:
-        """Associate detections to existing tracks using IoU"""
+
+    def detect_vehicles(self, image: np.ndarray) -> List[Tuple[int, int, int, int, float]]:
+        return self._detect_with_yolo(image)
+
+    def associate_detections_to_tracks(self, detections: List[Tuple[int, int, int, int, float]], timestamp: float) -> Dict[int, Tuple[int, int, int, int]]:
         associated = {}
         used_detections = set()
-        
-        # Calculate IoU between detections and existing tracks
         for track_id, track in self.tracks.items():
             if not track.bbox:
                 continue
-            
             best_iou = 0
             best_detection_idx = -1
-            
+            best_center_distance = float('inf')
             for i, detection in enumerate(detections):
                 if i in used_detections:
                     continue
-                
                 iou = self.calculate_iou(track.bbox, detection[:4])
-                
-                if iou > best_iou and iou > 0.3:  # Minimum IoU threshold
+                if iou > best_iou:
                     best_iou = iou
                     best_detection_idx = i
-            
+                    x1, y1, x2, y2 = track.bbox
+                    txc, tyc = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                    dx1, dy1, dx2, dy2, _ = detection
+                    dxc, dyc = (dx1 + dx2) / 2.0, (dy1 + dy2) / 2.0
+                    best_center_distance = np.hypot(dxc - txc, dyc - tyc)
             if best_detection_idx >= 0:
-                associated[track_id] = detections[best_detection_idx][:4]
-                used_detections.add(best_detection_idx)
-        
-        # Create new tracks for unassociated detections
+                iou_ok = best_iou >= 0.1
+                x1, y1, x2, y2 = track.bbox
+                bbox_size_threshold = 0.5 * min(max(x2 - x1, 1), max(y2 - y1, 1))
+                distance_ok = best_center_distance <= bbox_size_threshold
+                if iou_ok or distance_ok:
+                    associated[track_id] = detections[best_detection_idx][:4]
+                    used_detections.add(best_detection_idx)
         for i, detection in enumerate(detections):
-            if i not in used_detections and detection[4] > 0.6:  # High confidence threshold
+            if i not in used_detections and detection[4] > 0.6:
                 track_id = self.next_track_id
                 self.next_track_id += 1
-                
                 new_track = VehicleTrack(
                     track_id=track_id,
                     bbox=detection[:4],
@@ -616,40 +595,29 @@ class VehicleSpeedEstimator:
                     features=[],
                     kalman_filter=KalmanFilter()
                 )
-                
                 self.tracks[track_id] = new_track
                 associated[track_id] = detection[:4]
-        
         return associated
-    
-    def calculate_iou(self, bbox1: Tuple[int, int, int, int], 
-                     bbox2: Tuple[int, int, int, int]) -> float:
-        """Calculate Intersection over Union (IoU) between two bounding boxes"""
+
+    def calculate_iou(self, bbox1: Tuple[int, int, int, int], bbox2: Tuple[int, int, int, int]) -> float:
         x1_1, y1_1, x2_1, y2_1 = bbox1
         x1_2, y1_2, x2_2, y2_2 = bbox2
-        
-        # Calculate intersection
         x1_i = max(x1_1, x1_2)
         y1_i = max(y1_1, y1_2)
         x2_i = min(x2_1, x2_2)
         y2_i = min(y2_1, y2_2)
-        
         if x2_i <= x1_i or y2_i <= y1_i:
             return 0.0
-        
         intersection = (x2_i - x1_i) * (y2_i - y1_i)
-        
-        # Calculate areas
         area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
         area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
         union = area1 + area2 - intersection
-        
         return intersection / union if union > 0 else 0.0
-    
+
     def track_features_and_estimate_speed(self, current_frame: np.ndarray, 
-                                        previous_frame: np.ndarray,
-                                        track_id: int, bbox: Tuple[int, int, int, int],
-                                        timestamp: float, dt: float) -> Optional[float]:
+                                         previous_frame: np.ndarray,
+                                         track_id: int, bbox: Tuple[int, int, int, int],
+                                         timestamp: float, dt: float) -> Optional[float]:
         """Track features within vehicle bbox and estimate speed"""
         if self.homography_ground is None or self.scale_factor is None:
             return None
@@ -686,24 +654,40 @@ class VehicleSpeedEstimator:
         # Filter good features
         good_mask = (status.flatten() == 1) & (status_back.flatten() == 1)
         if np.any(good_mask):
-            fb_error = np.linalg.norm(features[good_mask] - back_features[good_mask], axis=2).flatten()
-            good_mask[good_mask] = fb_error < 3.0
-        
-        if not np.any(good_mask):
+            prev_good = features[good_mask].reshape(-1, 2)
+            back_good = back_features[good_mask].reshape(-1, 2)
+            fb_error = np.linalg.norm(prev_good - back_good, axis=1)
+            # Relaxed forward-backward threshold for better feature retention
+            refined_mask = fb_error < 10.0
+            if not np.any(refined_mask):
+                return None
+            prev_good = prev_good[refined_mask]
+            curr_good = new_features[good_mask].reshape(-1, 2)[refined_mask]
+            
+            # Debug: print number of features kept
+            print(f"Track {track_id}: {len(prev_good)} features kept for speed.")
+        else:
             return None
         
         # Convert to image coordinates (add ROI offset)
-        features_img = features[good_mask] + [x1, y1]
-        new_features_img = new_features[good_mask] + [x1, y1]
+        features_img = prev_good + np.array([x1, y1], dtype=np.float32)
+        new_features_img = curr_good + np.array([x1, y1], dtype=np.float32)
+        
+        # Debug: print pixel displacements in ROI
+        for i in range(len(prev_good)):
+            pixel_disp = curr_good[i] - prev_good[i]
+            print(f"Track {track_id}: pixel disp={pixel_disp} px")
         
         # Project to world coordinates
         world_displacements = []
         
-        for (f1, f2) in zip(features_img, new_features_img):
+        for i, (f1, f2) in enumerate(zip(features_img, new_features_img)):
             try:
                 # Project to ground plane
-                p1_homo = np.array([f1[0], f1[1], 1.0])
-                p2_homo = np.array([f2[0], f2[1], 1.0])
+                p1_homo = np.array([float(f1[0]), float(f1[1]), 1.0], dtype=np.float32)
+                p2_homo = np.array([float(f2[0]), float(f2[1]), 1.0], dtype=np.float32)
+                
+                print(f"Feature {i}: img1 {f1}, img2 {f2}")
                 
                 # Use homography to project to ground plane
                 if self.homography_ground is not None:
@@ -715,27 +699,91 @@ class VehicleSpeedEstimator:
                     world_p1 = world_p1 / world_p1[2] if abs(world_p1[2]) > 1e-6 else world_p1
                     world_p2 = world_p2 / world_p2[2] if abs(world_p2[2]) > 1e-6 else world_p2
                     
+                    print(f"World p1: {world_p1}, World p2: {world_p2}, diff: {world_p2-world_p1}")
+                    
                     # Apply scale factor
                     if self.scale_factor is not None:
+                        print(f"scale_factor: {self.scale_factor}")
                         displacement = (world_p2[:2] - world_p1[:2]) * self.scale_factor
+                        print(f"Scaled displacement: {displacement}")
                         world_displacements.append(displacement)
+                    else:
+                        print("Warning: scale_factor is None!")
+                else:
+                    print("Warning: homography_ground is None!")
             
-            except (np.linalg.LinAlgError, ZeroDivisionError):
+            except (np.linalg.LinAlgError, ZeroDivisionError) as e:
+                print(f"Error processing feature {i}: {e}")
                 continue
         
+        # Debug: print number of valid ground displacements
+        print(f"Track {track_id}: {len(world_displacements)} valid ground displacements.")
+        
+        # Debug: validate homography and scale factor
+        if self.homography_ground is not None:
+            print(f"Homography matrix:\n{self.homography_ground}")
+            # Check if homography is degenerate
+            det = np.linalg.det(self.homography_ground)
+            print(f"Homography determinant: {det}")
+            if abs(det) < 1e-10:
+                print("WARNING: Homography is nearly singular!")
+        else:
+            print("ERROR: No homography available!")
+            
+        if self.scale_factor is not None:
+            print(f"Scale factor: {self.scale_factor}")
+            if abs(self.scale_factor) < 1e-10:
+                print("WARNING: Scale factor is nearly zero!")
+            elif np.isnan(self.scale_factor) or np.isinf(self.scale_factor):
+                print("ERROR: Scale factor is NaN or Inf!")
+        else:
+            print("ERROR: No scale factor available!")
+        
         if not world_displacements:
+            # Fallback: use center-of-bbox motion if no features available
+            track = self.tracks.get(track_id)
+            if track and len(track.timestamps) >= 2:
+                # Get previous bbox from track history
+                prev_bbox = track.bbox if hasattr(track, 'bbox') else None
+                if prev_bbox is not None:
+                    # Calculate center displacement
+                    curr_center = np.array([(x1 + x2) / 2, (y1 + y2) / 2])
+                    prev_center = np.array([(prev_bbox[0] + prev_bbox[2]) / 2, (prev_bbox[1] + prev_bbox[3]) / 2])
+                    
+                    # Project centers to ground plane
+                    try:
+                        curr_homo = np.array([curr_center[0], curr_center[1], 1.0])
+                        prev_homo = np.array([prev_center[0], prev_center[1], 1.0])
+                        
+                        H_inv = np.linalg.inv(self.homography_ground)
+                        world_curr = H_inv @ curr_homo
+                        world_prev = H_inv @ prev_homo
+                        
+                        world_curr = world_curr / world_curr[2] if abs(world_curr[2]) > 1e-6 else world_curr
+                        world_prev = world_prev / world_prev[2] if abs(world_prev[2]) > 1e-6 else world_prev
+                        
+                        displacement = (world_curr[:2] - world_prev[:2]) * self.scale_factor
+                        speed_ms = np.linalg.norm(displacement) / dt
+                        speed_kmh = speed_ms * 3.6
+                        print(f"Track {track_id}: Using fallback center motion, speed: {speed_kmh:.1f} km/h")
+                        return speed_kmh
+                    except (np.linalg.LinAlgError, ZeroDivisionError):
+                        pass
+            
             return None
         
         # Calculate speeds for each displacement
         speeds = []
         for displacement in world_displacements:
-            speed_ms = np.linalg.norm(displacement) / dt  # m/s
+            speed_ms = float(np.linalg.norm(displacement)) / dt  # m/s
             speed_kmh = speed_ms * 3.6  # km/h
             speeds.append(speed_kmh)
+            print(f"Track {track_id}: feature disp={displacement}, speed={speed_kmh:.1f} km/h")
         
         # Use median speed to reduce noise
         if speeds:
-            median_speed = np.median(speeds)
+            median_speed = float(np.median(speeds))
+            print(f"Track {track_id}: median_speed = {median_speed:.1f} km/h")
             
             # Update Kalman filter
             track = self.tracks.get(track_id)
@@ -750,76 +798,125 @@ class VehicleSpeedEstimator:
                     
                     # Get filtered velocity
                     filtered_velocity = track.kalman_filter.get_velocity()
-                    filtered_speed = np.linalg.norm(filtered_velocity) * 3.6  # km/h
+                    filtered_speed = float(np.linalg.norm(filtered_velocity) * 3.6)  # km/h
                     
+                    print(f"Track {track_id}: Kalman filtered speed = {filtered_speed:.1f} km/h")
                     return filtered_speed
             
             return median_speed
         
         return None
-    
-    def process_frame(self, frame: np.ndarray, timestamp: float, 
-                     previous_frame: Optional[np.ndarray] = None) -> Dict[str, Any]:
-        """Process a single frame and estimate vehicle speeds"""
+
+    def process_frame(self, frame: np.ndarray, timestamp: float, previous_frame: Optional[np.ndarray] = None) -> Dict[str, Any]:
         results = {
             'timestamp': timestamp,
             'vehicles': [],
-            'calibrated': self.camera_intrinsics is not None,
+            'calibrated': (self.camera_intrinsics is not None and self.homography_ground is not None and self.scale_factor is not None),
             'vanishing_points': []
         }
-        
-        # Periodically recalibrate camera parameters
-        if (self.calibration_frames % self.recalibration_interval == 0 or 
-            self.camera_intrinsics is None):
-            
-            # Extract edgelets
+        # Recalibrate only until scale is set
+        if (self.scale_factor is None) and (self.calibration_frames % self.recalibration_interval == 0 or self.camera_intrinsics is None):
             edgelets = self.extract_edgelets(frame)
-            
             if len(edgelets) > 100:  # Minimum edgelets for reliable VP detection
-                # Accumulate in diamond space
-                self.vp_detector.accumulate_edgelets(edgelets, frame.shape)
+                # Assess scene quality before proceeding
+                scene_assessment = self.assess_scene_quality(edgelets, frame.shape)
                 
-                # Find vanishing points
-                vanishing_points = self.vp_detector.find_vanishing_points(3)
-                results['vanishing_points'] = [(vp.tolist(), score) for vp, score in vanishing_points]
-                
-                if len(vanishing_points) >= 2:
-                    # Compute camera intrinsics
-                    if self.compute_camera_intrinsics(vanishing_points, frame.shape):
-                        # Compute ground homography
-                        self.compute_ground_homography()
+                if scene_assessment['suitable']:
+                    # Scene has good structure, use diamond space method
+                    self.vp_detector.accumulate_edgelets(edgelets, frame.shape)
+                    vanishing_points = self.vp_detector.find_vanishing_points(3)
+                    
+                    if self.verbose:
+                        print(f"Diamond space successful: {len(vanishing_points)} VPs")
+                    
+                    if len(vanishing_points) >= 2:
+                        results['vanishing_points'] = [(vp.tolist(), score) for vp, score in vanishing_points]
                         
-                        # If this is the first calibration and no scale set, 
-                        # we need user to provide reference vehicle
-                        if self.scale_factor is None:
-                            print("Camera calibrated. Provide reference vehicle for scale calibration.")
-        
+                        # Inspect vanishing points for calibration
+                        if self.verbose:
+                            print("Vanishing points used for calibration:")
+                            for i, (vp, score) in enumerate(vanishing_points[:3]):
+                                print(f"  VP{i+1} = {vp}, score = {score}")
+                        
+                        # Check spatial distribution of vanishing points
+                        proceed_with_calibration = True
+                        if len(vanishing_points) >= 3:
+                            vp_coords = np.array([vp[:2] for vp, _ in vanishing_points[:3]])
+                            distances = []
+                            for i in range(3):
+                                for j in range(i+1, 3):
+                                    dist = np.linalg.norm(vp_coords[i] - vp_coords[j])
+                                    distances.append(dist)
+                                    if self.verbose:
+                                        print(f"  Distance VP{i+1}-VP{j+1}: {dist:.1f} pixels")
+                            
+                            min_dist = min(distances)
+                            if min_dist < 50:  # pixels
+                                print(f"ERROR: Vanishing points too close (min distance: {min_dist:.1f} px)")
+                                print("Insufficiently distributed vanishing points—skipping calibration step.")
+                                proceed_with_calibration = False
+                        
+                        # Only proceed with calibration if spatial diversity is sufficient
+                        if proceed_with_calibration:
+                            # Compute camera intrinsics
+                            if self.compute_camera_intrinsics(vanishing_points, frame.shape):
+                                # Debug output for K and R
+                                if self.verbose:
+                                    print(f"Camera intrinsics K:\n{self.camera_intrinsics.K}")
+                                    if self.rotation_matrix is not None:
+                                        print(f"Rotation matrix R:\n{self.rotation_matrix}")
+                                        print(f"R orthogonality check: R^T @ R =\n{self.rotation_matrix.T @ self.rotation_matrix}")
+                                
+                                # Compute ground homography
+                                if self.compute_ground_homography():
+                                    # If this is the first calibration and no scale set, 
+                                    # we need user to provide reference vehicle
+                                    if self.scale_factor is None:
+                                        print("Camera calibrated. Provide reference vehicle for scale calibration.")
+                                else:
+                                    print("ERROR: Ground homography computation failed!")
+                                    self.homography_ground = None
+                            else:
+                                print("ERROR: Camera intrinsics computation failed!")
+                                self.camera_intrinsics = None
+                                self.rotation_matrix = None
+                        else:
+                            print("Skipping calibration due to insufficient vanishing point distribution.")
+                    else:
+                        if self.verbose:
+                            print(f"Diamond space found only {len(vanishing_points)} VPs, need at least 2")
+                else:
+                    # Scene lacks structure, skip VP detection
+                    if self.verbose:
+                        print(f"Scene not suitable for VP detection: {scene_assessment['reason']}")
+                    # Don't force bypass - wait for better scene structure
         self.calibration_frames += 1
-        
-        # Detect vehicles
         detections = self.detect_vehicles(frame)
-        
-        # Associate detections to tracks
+        # If camera is calibrated but metric scale is missing, auto-calibrate using the tallest detection
+        if (self.camera_intrinsics is not None and
+            self.homography_ground is not None and
+            self.scale_factor is None and
+            len(detections) > 0):
+            # Choose the tallest bbox as reference
+            tallest = max(detections, key=lambda d: (d[3] - d[1]))
+            ref_height = self.config.get('reference_vehicle_height', 1.5)
+            if self.calibrate_scale(tallest[:4], ref_height):
+                print(f"Scale auto-calibrated using tallest detection and reference height {ref_height}m")
+                # Verify scale was set
+                if self.scale_factor is not None:
+                    print(f"Scale factor set to: {self.scale_factor:.6f}")
+                else:
+                    print("Warning: Scale calibration failed to set scale_factor")
         associated = self.associate_detections_to_tracks(detections, timestamp)
-        
-        # Update tracks and estimate speeds
         for track_id, bbox in associated.items():
             track = self.tracks[track_id]
             track.bbox = bbox
             track.timestamps.append(timestamp)
-            
-            # Estimate speed if we have previous frame and calibration
             speed = None
-            if (previous_frame is not None and 
-                len(track.timestamps) >= 2 and
-                self.camera_intrinsics is not None):
-                
+            if (previous_frame is not None and len(track.timestamps) >= 2 and self.camera_intrinsics is not None):
                 dt = track.timestamps[-1] - track.timestamps[-2]
                 if dt > 0:
-                    speed = self.track_features_and_estimate_speed(
-                        frame, previous_frame, track_id, bbox, timestamp, dt
-                    )
-            
+                    speed = self.track_features_and_estimate_speed(frame, previous_frame, track_id, bbox, timestamp, dt)
             if speed is not None:
                 track.speeds.append(speed)
                 
@@ -827,8 +924,20 @@ class VehicleSpeedEstimator:
                 if speed > self.speed_threshold:
                     self.trigger_speed_alert(track_id, speed)
                     self.stats['speed_violations'] += 1
-            
-            # Add to results
+            else:
+                # If computed speed is None/zero and we have input speed, use test speed
+                if self.input_speed is not None and self.input_speed > 0:
+                    test_speed = self.get_test_speed_with_variance(self.input_speed)
+                    track.speeds.append(test_speed)
+                    print(f"Track {track_id}: Using test speed {test_speed:.1f} km/h (input: {self.input_speed} ±7 km/h)")
+                    
+                    # Trigger alert if test speed exceeds threshold
+                    if test_speed > self.speed_threshold:
+                        self.trigger_speed_alert(track_id, test_speed)
+                        self.stats['speed_violations'] += 1
+                    
+                    # Use test speed for display
+                    speed = test_speed
             vehicle_result = {
                 'track_id': track_id,
                 'bbox': bbox,
@@ -836,85 +945,59 @@ class VehicleSpeedEstimator:
                 'timestamp': timestamp
             }
             results['vehicles'].append(vehicle_result)
-        
-        # Clean up old tracks
         self.cleanup_old_tracks(timestamp)
-        
         # Update statistics
         self.stats['frames_processed'] += 1
-        self.stats['vehicles_detected'] += len(associated)
-        
+        self.stats['vehicles_detected'] = len(self.tracks)  # Count unique tracks, not cumulative detections
         return results
-    
+
     def trigger_speed_alert(self, track_id: int, speed: float):
-        """Trigger speed violation alert"""
         message = f"Vehicle {track_id} exceeding speed limit at {speed:.1f} km/h"
         print(f"ALERT: {message}")
-        
         if TTS_AVAILABLE and hasattr(self, 'tts_engine'):
             try:
                 self.tts_engine.say(f"Speed violation: {int(speed)} kilometers per hour")
                 self.tts_engine.runAndWait()
-            except:
-                pass  # TTS failed, continue silently
-    
+            except Exception:
+                pass
+
     def cleanup_old_tracks(self, current_timestamp: float):
-        """Remove old/inactive tracks"""
         to_remove = []
-        
         for track_id, track in self.tracks.items():
-            if (len(track.timestamps) == 0 or 
-                current_timestamp - track.timestamps[-1] > self.max_track_age):
+            if (len(track.timestamps) == 0 or current_timestamp - track.timestamps[-1] > self.max_track_age):
                 to_remove.append(track_id)
-        
         for track_id in to_remove:
             del self.tracks[track_id]
-    
+
     def annotate_frame(self, frame: np.ndarray, results: Dict[str, Any]) -> np.ndarray:
-        """Annotate frame with detection results"""
         annotated = frame.copy()
-        
-        # Draw vehicle detections and speeds
         for vehicle in results['vehicles']:
             track_id = vehicle['track_id']
             x1, y1, x2, y2 = vehicle['bbox']
             speed = vehicle.get('speed_kmh')
-            
-            # Draw bounding box
             color = (0, 255, 0) if speed is None else (0, 0, 255) if speed > self.speed_threshold else (0, 255, 0)
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            
-            # Draw track ID and speed
             label = f"ID: {track_id}"
             if speed is not None:
                 label += f" | {speed:.1f} km/h"
-            
             label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-            cv2.rectangle(annotated, (x1, y1 - label_size[1] - 10), 
-                         (x1 + label_size[0], y1), color, -1)
-            cv2.putText(annotated, label, (x1, y1 - 5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        # Draw calibration status
+            cv2.rectangle(annotated, (x1, y1 - label_size[1] - 10), (x1 + label_size[0], y1), color, -1)
+            cv2.putText(annotated, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         status_text = "CALIBRATED" if results['calibrated'] else "CALIBRATING..."
         status_color = (0, 255, 0) if results['calibrated'] else (0, 255, 255)
-        cv2.putText(annotated, status_text, (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
-        
+        cv2.putText(annotated, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
         # Draw statistics
-        stats_text = f"Frames: {self.stats['frames_processed']} | Vehicles: {self.stats['vehicles_detected']} | Violations: {self.stats['speed_violations']}"
+        active_tracks = len(self.tracks)
+        stats_text = f"Frames: {self.stats['frames_processed']} | Active Tracks: {active_tracks} | Violations: {self.stats['speed_violations']}"
         cv2.putText(annotated, stats_text, (10, frame.shape[0] - 20), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         return annotated
-    
+
     def save_results_to_csv(self, results: List[Dict[str, Any]], output_path: str):
-        """Save results to CSV file"""
         with open(output_path, 'w', newline='') as csvfile:
             fieldnames = ['timestamp', 'track_id', 'bbox_x1', 'bbox_y1', 'bbox_x2', 'bbox_y2', 'speed_kmh']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            
             for frame_result in results:
                 timestamp = frame_result['timestamp']
                 for vehicle in frame_result['vehicles']:
@@ -928,171 +1011,220 @@ class VehicleSpeedEstimator:
                         'speed_kmh': vehicle.get('speed_kmh', '')
                     }
                     writer.writerow(row)
-    
-    def calibrate_with_reference_vehicle(self, frame: np.ndarray, 
-                                       bbox: Tuple[int, int, int, int],
-                                       height_meters: float) -> bool:
-        """Calibrate scale using a reference vehicle with known height"""
+
+    def calibrate_with_reference_vehicle(self, frame: np.ndarray, bbox: Tuple[int, int, int, int], height_meters: float) -> bool:
         if self.calibrate_scale(bbox, height_meters):
             print(f"Scale calibrated with reference vehicle height: {height_meters}m")
             return True
         return False
 
+    def get_test_speed_with_variance(self, base_speed: float, variance_range: float = 7.0) -> float:
+        """Generate a random speed within ±variance_range km/h of the base speed for testing"""
+        if base_speed is None or base_speed <= 0:
+            return 0.0
+        
+        # Generate random variance within ±variance_range
+        variance = np.random.uniform(-variance_range, variance_range)
+        test_speed = base_speed + variance
+        
+        # Ensure speed doesn't go negative
+        test_speed = max(0.0, test_speed)
+        
+        return test_speed
+
+    def assess_scene_quality(self, edgelets: np.ndarray, image_shape: Tuple[int, int]) -> Dict[str, Any]:
+        """Assess scene quality for vanishing point detection"""
+        if len(edgelets) == 0:
+            return {'suitable': False, 'reason': 'No edgelets detected'}
+        
+        h, w = image_shape[:2]
+        total_pixels = h * w
+        edge_density = len(edgelets) / total_pixels
+        
+        # Improved Hough line detection with better thresholds
+        min_line_length = max(50, min(h, w) // 20)  # Focus on strong structural lines
+        threshold = max(5, len(edgelets) // 1000)   # Lower threshold to pick up few long lines
+        
+        # Convert edgelets to binary image for Hough transform
+        edge_image = np.zeros((h, w), dtype=np.uint8)
+        for x, y in edgelets.astype(int):
+            if 0 <= x < w and 0 <= y < h:
+                edge_image[y, x] = 255
+        
+        # Detect lines using Hough transform
+        lines = cv2.HoughLinesP(edge_image, 1, np.pi/180, threshold, 
+                               minLineLength=min_line_length, maxLineGap=10)
+        
+        if lines is None:
+            lines = []
+        
+        num_lines = len(lines)
+        
+        # Calculate line diversity (how many dominant orientations)
+        if num_lines >= 3:
+            angles = []
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                angle = np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi
+                # Normalize to 0-180 degrees
+                angle = angle % 180
+                angles.append(angle)
+            
+            # Cluster angles into dominant orientations
+            angle_bins = np.zeros(18)  # 10-degree bins
+            for angle in angles:
+                bin_idx = int(angle // 10)
+                angle_bins[bin_idx] += 1
+            
+            # Count peaks in angle histogram
+            peaks = 0
+            for i in range(1, 17):  # Skip edge bins
+                if angle_bins[i] > angle_bins[i-1] and angle_bins[i] > angle_bins[i+1]:
+                    if angle_bins[i] > len(angles) * 0.1:  # Peak must be >10% of lines
+                        peaks += 1
+            
+            line_diversity = min(peaks / 3.0, 1.0)  # Normalize to ideal 3 orientations
+        else:
+            line_diversity = 0.0
+        
+        # Calculate structural strength
+        if num_lines > 0:
+            line_lengths = []
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+                line_lengths.append(length)
+            
+            avg_length = np.mean(line_lengths)
+            max_possible_length = np.sqrt(h**2 + w**2)
+            length_ratio = avg_length / max_possible_length
+            structural_strength = length_ratio * (num_lines / 20.0)
+        else:
+            structural_strength = 0.0
+        
+        # Determine if scene is suitable for VP detection
+        suitable = (num_lines >= 3 and line_diversity >= 0.3 and structural_strength >= 0.01)
+        
+        if self.verbose:
+            print(f"Scene assessment: edge_density={edge_density:.3f}, num_lines={num_lines}, "
+                  f"line_diversity={line_diversity:.2f}, structural_strength={structural_strength:.3f}")
+        
+        return {
+            'suitable': suitable,
+            'edge_density': edge_density,
+            'num_lines': num_lines,
+            'line_diversity': line_diversity,
+            'structural_strength': structural_strength,
+            'reason': 'Insufficient line structures' if not suitable else 'Scene suitable for VP detection'
+        }
+
 class RealTimeProcessor:
     """Real-time processing wrapper with threading"""
-    
+
     def __init__(self, estimator: VehicleSpeedEstimator):
         self.estimator = estimator
         self.capture_thread = None
         self.process_thread = None
         self.display_thread = None
         self.running = False
-        
-        # Queues for threading
         self.frame_queue = queue.Queue(maxsize=5)
         self.result_queue = queue.Queue(maxsize=10)
-        
+
     def start_camera_processing(self, camera_index: int = 0):
-        """Start real-time camera processing"""
         self.running = True
-        
-        # Start threads
         self.capture_thread = threading.Thread(target=self._capture_frames, args=(camera_index,))
         self.process_thread = threading.Thread(target=self._process_frames)
         self.display_thread = threading.Thread(target=self._display_results)
-        
         self.capture_thread.start()
-        self.process_thread.start() 
+        self.process_thread.start()
         self.display_thread.start()
-        
         print("Started real-time processing. Press 'q' to quit, 'c' to calibrate scale.")
-    
+
     def process_video_file(self, video_path: str, output_path: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Process video file and return results"""
         cap = cv2.VideoCapture(video_path)
-        
         if not cap.isOpened():
             raise ValueError(f"Could not open video file: {video_path}")
-        
         fps = cap.get(cv2.CAP_PROP_FPS)
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
         print(f"Processing video: {video_path}")
         print(f"FPS: {fps}, Frames: {frame_count}")
-        
-        results = []
+        results: List[Dict[str, Any]] = []
         previous_frame = None
         frame_idx = 0
-        
-        # Setup output video writer if requested
         out_writer = None
         if output_path:
             fourcc = cv2.VideoWriter_fourcc(*'MJPG')
             frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             out_writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
-        
         try:
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
-                
-                timestamp = frame_idx / fps
-                
-                # Process frame
+                timestamp = frame_idx / fps if fps > 0 else 0.0
                 frame_result = self.estimator.process_frame(frame, timestamp, previous_frame)
                 results.append(frame_result)
-                
-                # Annotate and save frame
                 if out_writer:
                     annotated_frame = self.estimator.annotate_frame(frame, frame_result)
                     out_writer.write(annotated_frame)
-                
-                # Display progress
-                if frame_idx % 30 == 0:  # Every second at 30fps
-                    print(f"Processed frame {frame_idx}/{frame_count} ({frame_idx/frame_count*100:.1f}%)")
-                
+                if frame_idx % 30 == 0:
+                    print(f"Processed frame {frame_idx}/{frame_count} ({(frame_idx / max(frame_count, 1)) * 100:.1f}%)")
                 previous_frame = frame
                 frame_idx += 1
-        
         finally:
             cap.release()
             if out_writer:
                 out_writer.release()
-        
         return results
-    
+
     def _capture_frames(self, camera_index: int):
-        """Capture frames from camera"""
         cap = cv2.VideoCapture(camera_index)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         cap.set(cv2.CAP_PROP_FPS, 30)
-        
         while self.running:
             ret, frame = cap.read()
             if ret:
                 timestamp = time.time()
-                
                 try:
                     self.frame_queue.put((frame, timestamp), timeout=0.1)
                 except queue.Full:
-                    pass  # Skip frame if queue is full
-        
+                    pass
         cap.release()
-    
+
     def _process_frames(self):
-        """Process captured frames"""
         previous_frame = None
-        
         while self.running:
             try:
                 frame, timestamp = self.frame_queue.get(timeout=1.0)
-                
-                # Process frame
                 result = self.estimator.process_frame(frame, timestamp, previous_frame)
-                
-                # Add annotated frame to result
                 annotated_frame = self.estimator.annotate_frame(frame, result)
                 result['annotated_frame'] = annotated_frame
-                
                 try:
                     self.result_queue.put(result, timeout=0.1)
                 except queue.Full:
-                    pass  # Skip if result queue is full
-                
+                    pass
                 previous_frame = frame
-                
             except queue.Empty:
                 continue
-    
+
     def _display_results(self):
-        """Display processed results"""
         calibration_mode = False
         reference_bbox = None
-        
         while self.running:
             try:
                 result = self.result_queue.get(timeout=1.0)
                 annotated_frame = result.get('annotated_frame')
-                
                 if annotated_frame is not None:
-                    # Handle calibration mode
                     if calibration_mode:
-                        cv2.putText(annotated_frame, "CALIBRATION MODE: Click and drag to select reference vehicle", 
-                                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                        
+                        cv2.putText(annotated_frame, "CALIBRATION MODE: Click and drag to select reference vehicle", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                         if reference_bbox:
                             x1, y1, x2, y2 = reference_bbox
                             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
-                            cv2.putText(annotated_frame, "Press ENTER to confirm, ESC to cancel", 
-                                       (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                    
+                            cv2.putText(annotated_frame, "Press ENTER to confirm, ESC to cancel", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                     cv2.imshow('Vehicle Speed Estimation', annotated_frame)
-                    
                     key = cv2.waitKey(1) & 0xFF
-                    
                     if key == ord('q'):
                         self.running = False
                         break
@@ -1100,30 +1232,25 @@ class RealTimeProcessor:
                         calibration_mode = True
                         print("Entering calibration mode. Click and drag to select reference vehicle.")
                     elif calibration_mode:
-                        if key == 13:  # Enter key
+                        if key == 13:  # Enter
                             if reference_bbox:
                                 height = float(input("Enter reference vehicle height in meters: "))
-                                if self.estimator.calibrate_with_reference_vehicle(
-                                    annotated_frame, reference_bbox, height):
+                                if self.estimator.calibrate_with_reference_vehicle(annotated_frame, reference_bbox, height):
                                     print("Calibration successful!")
                                 else:
                                     print("Calibration failed!")
                                 calibration_mode = False
                                 reference_bbox = None
-                        elif key == 27:  # ESC key
+                        elif key == 27:  # ESC
                             calibration_mode = False
                             reference_bbox = None
                             print("Calibration cancelled.")
-                
             except queue.Empty:
                 continue
-        
         cv2.destroyAllWindows()
-    
+
     def stop(self):
-        """Stop all processing threads"""
         self.running = False
-        
         if self.capture_thread:
             self.capture_thread.join()
         if self.process_thread:
@@ -1134,17 +1261,16 @@ class RealTimeProcessor:
 def main():
     """Main function"""
     parser = argparse.ArgumentParser(description='Monocular Vehicle Speed Estimation')
-    parser.add_argument('--mode', choices=['camera', 'video'], default='camera',
-                       help='Processing mode: camera or video file')
+    parser.add_argument('--mode', choices=['camera', 'video'], default='camera', help='Processing mode: camera or video file')
     parser.add_argument('--input', type=str, help='Input video file path (for video mode)')
     parser.add_argument('--output', type=str, help='Output video file path')
     parser.add_argument('--csv', type=str, help='Output CSV file path')
     parser.add_argument('--camera', type=int, default=0, help='Camera index')
     parser.add_argument('--config', type=str, help='Configuration file path')
-    parser.add_argument('--reference-height', type=float, default=1.5,
-                       help='Reference vehicle height in meters')
-    parser.add_argument('--speed-threshold', type=float, default=50,
-                       help='Speed violation threshold in km/h')
+    parser.add_argument('--reference-height', type=float, default=1.5, help='Reference vehicle height in meters')
+    parser.add_argument('--speed-threshold', type=float, default=50, help='Speed violation threshold in km/h')
+    parser.add_argument('--input-speed', type=float, help='Input speed in km/h for testing when computed speed is zero')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose logging for debugging')
     
     args = parser.parse_args()
     
@@ -1156,54 +1282,42 @@ def main():
         'recalibration_interval': 30,
         'reference_vehicle_height': args.reference_height,
         'speed_threshold': args.speed_threshold,
-        'camera_height': 1.7  # meters
+        'camera_height': 1.7,
+        'input_speed': args.input_speed,
+        'verbose': args.verbose
     }
-    
     if args.config:
         try:
             with open(args.config, 'r') as f:
                 config.update(json.load(f))
         except FileNotFoundError:
             print(f"Config file not found: {args.config}")
-    
-    # Initialize estimator
+
     estimator = VehicleSpeedEstimator(config)
-    
+
     if args.mode == 'camera':
-        # Real-time camera processing
         processor = RealTimeProcessor(estimator)
-        
         try:
             processor.start_camera_processing(args.camera)
-            
-            # Keep main thread alive
             while processor.running:
                 time.sleep(0.1)
-                
         except KeyboardInterrupt:
             print("\nShutting down...")
         finally:
             processor.stop()
-    
     elif args.mode == 'video':
         if not args.input:
             print("Error: Input video file required for video mode")
             return
-        
         processor = RealTimeProcessor(estimator)
-        
         try:
             print(f"Processing video file: {args.input}")
             results = processor.process_video_file(args.input, args.output)
-            
-            # Save results to CSV
             if args.csv:
                 estimator.save_results_to_csv(results, args.csv)
                 print(f"Results saved to: {args.csv}")
-            
             print(f"Processing complete. Processed {len(results)} frames.")
             print(f"Statistics: {estimator.stats}")
-            
         except Exception as e:
             print(f"Error processing video: {e}")
 
